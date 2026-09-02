@@ -1,0 +1,158 @@
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, unlink } from "node:fs/promises";
+import path from "node:path";
+import { z } from "zod";
+const maximumLeaseMetadataBytes = 1_024;
+const leaseMetadataSchema = z.object({
+    version: z.literal(1),
+    leaseId: z.string().uuid(),
+    ownerKind: z.enum(["mcp", "cli"]),
+    pid: z.number().int().positive(),
+    acquiredAt: z.string().datetime(),
+}).strict();
+export async function acquireLiveOperationCoordinator(options) {
+    const stateDirectory = path.join(path.resolve(options.dataDir), "state");
+    const lockPath = path.join(stateDirectory, "live-operation.lock");
+    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+    let handle;
+    try {
+        handle = await open(lockPath, "wx", 0o600);
+    }
+    catch (error) {
+        if (isNodeError(error) && error.code === "EEXIST") {
+            throw new Error("LIVE_RUNTIME_BUSY", { cause: error });
+        }
+        throw error;
+    }
+    const metadata = leaseMetadataSchema.parse({
+        version: 1,
+        leaseId: randomUUID(),
+        ownerKind: options.ownerKind,
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+    });
+    try {
+        await handle.writeFile(JSON.stringify(metadata), "utf8");
+        await handle.sync();
+        const identity = await handle.stat();
+        return new PersistentLiveOperationCoordinator(lockPath, handle, identity.dev, identity.ino, metadata);
+    }
+    catch (error) {
+        await removeCreatedMarker(lockPath, handle);
+        throw error;
+    }
+}
+class PersistentLiveOperationCoordinator {
+    lockPath;
+    handle;
+    device;
+    inode;
+    metadata;
+    tail = Promise.resolve();
+    closing = false;
+    closePromise = null;
+    constructor(lockPath, handle, device, inode, metadata) {
+        this.lockPath = lockPath;
+        this.handle = handle;
+        this.device = device;
+        this.inode = inode;
+        this.metadata = metadata;
+    }
+    runExclusive(operation) {
+        if (this.closing) {
+            return Promise.reject(new Error("LIVE_RUNTIME_CLOSED"));
+        }
+        const result = this.tail.then(operation, operation);
+        this.tail = result.then(() => undefined, () => undefined);
+        return result;
+    }
+    close() {
+        if (this.closePromise !== null)
+            return this.closePromise;
+        this.closing = true;
+        this.closePromise = this.tail.then(() => this.release(), () => this.release());
+        return this.closePromise;
+    }
+    async release() {
+        let verificationHandle = null;
+        try {
+            const initialPathIdentity = await lstat(this.lockPath);
+            assertExactRegularFile(initialPathIdentity, this.device, this.inode);
+            const ownedIdentity = await this.handle.stat();
+            assertExactRegularFile(ownedIdentity, this.device, this.inode);
+            verificationHandle = await open(this.lockPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+            const verificationIdentity = await verificationHandle.stat();
+            assertExactRegularFile(verificationIdentity, this.device, this.inode);
+            const serialized = await readBounded(verificationHandle);
+            const parsed = parseLeaseMetadata(serialized);
+            if (!sameLeaseMetadata(parsed, this.metadata)) {
+                throw new Error("LIVE_LEASE_OWNERSHIP_LOST");
+            }
+            const pathIdentity = await lstat(this.lockPath);
+            assertExactRegularFile(pathIdentity, this.device, this.inode);
+            await unlink(this.lockPath);
+        }
+        catch (error) {
+            if (error instanceof Error && error.message === "LIVE_LEASE_OWNERSHIP_LOST") {
+                throw error;
+            }
+            throw new Error("LIVE_LEASE_OWNERSHIP_LOST", { cause: error });
+        }
+        finally {
+            await verificationHandle?.close().catch(() => undefined);
+            await this.handle.close().catch(() => undefined);
+        }
+    }
+}
+async function readBounded(handle) {
+    const buffer = Buffer.alloc(maximumLeaseMetadataBytes + 1);
+    let length = 0;
+    while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (bytesRead === 0)
+            break;
+        length += bytesRead;
+    }
+    if (length > maximumLeaseMetadataBytes) {
+        throw new Error("LIVE_LEASE_OWNERSHIP_LOST");
+    }
+    return buffer.subarray(0, length).toString("utf8");
+}
+function assertExactRegularFile(identity, device, inode) {
+    if (!identity.isFile() || identity.dev !== device || identity.ino !== inode) {
+        throw new Error("LIVE_LEASE_OWNERSHIP_LOST");
+    }
+}
+async function removeCreatedMarker(lockPath, handle) {
+    try {
+        const [owned, current] = await Promise.all([handle.stat(), lstat(lockPath)]);
+        if (owned.dev === current.dev && owned.ino === current.ino) {
+            await unlink(lockPath);
+        }
+    }
+    catch {
+        // The failed initialization is already unusable; never remove an unverified path.
+    }
+    finally {
+        await handle.close().catch(() => undefined);
+    }
+}
+function parseLeaseMetadata(serialized) {
+    try {
+        return leaseMetadataSchema.parse(JSON.parse(serialized));
+    }
+    catch (error) {
+        throw new Error("LIVE_LEASE_OWNERSHIP_LOST", { cause: error });
+    }
+}
+function sameLeaseMetadata(left, right) {
+    return (left.version === right.version &&
+        left.leaseId === right.leaseId &&
+        left.ownerKind === right.ownerKind &&
+        left.pid === right.pid &&
+        left.acquiredAt === right.acquiredAt);
+}
+function isNodeError(error) {
+    return error instanceof Error && "code" in error;
+}

@@ -1,0 +1,1474 @@
+import { Buffer } from "node:buffer";
+import { execFile, spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { constants } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  unlink,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { createInterface } from "node:readline";
+import { clearTimeout, setTimeout } from "node:timers";
+import { pathToFileURL } from "node:url";
+
+export const PAYLOAD_MANIFEST_VERSION = 1;
+export const PAYLOAD_MANIFEST_FILENAME = "payload-manifest.json";
+export const PAYLOAD_MANIFEST_SHA256_FILENAME = "payload-manifest.sha256";
+export const NATIVE_RUNTIME_PATH =
+  "native/WechatVisionBridge/.build/arm64-apple-macosx/debug/WechatVisionBridge";
+
+const metadataFilenames = new Set([
+  PAYLOAD_MANIFEST_FILENAME,
+  PAYLOAD_MANIFEST_SHA256_FILENAME,
+]);
+const sha256Pattern = /^[a-f0-9]{64}$/u;
+const bridgeProtocolVersion = 2;
+const nativeProtocolVersion = 1;
+const runtimeContractVersion = 2;
+const commandTimeoutMs = 120_000;
+const bridgeTimeoutMs = 15_000;
+const sourceSnapshotInputs = [
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "vitest.config.ts",
+  "src",
+  "tests",
+  "scripts/verify-automation-contract.mjs",
+  "scripts/verify-automation-contract.d.mts",
+  "config/automation-daily-care.config.toml",
+  "config/automation-restricted.config.toml",
+  "prompts/automation-daily-care-v1.md",
+  "prompts/automation-direct-reply-v1.md",
+  "runtime-bin",
+  "native/WechatVisionBridge/Package.swift",
+  "native/WechatVisionBridge/Sources",
+  "native/WechatVisionBridge/Tests",
+];
+
+export async function buildReleasePayload(options) {
+  const sourceRoot = path.resolve(options.sourceRoot);
+  const payloadRoot = path.resolve(options.payloadRoot);
+  const workRoot = path.resolve(options.workRoot);
+  await assertSourceRoot(sourceRoot);
+  await createEmptyDirectory(payloadRoot, "RELEASE_PAYLOAD_ROOT_NOT_EMPTY");
+  await createEmptyDirectory(workRoot, "RELEASE_WORK_ROOT_NOT_EMPTY");
+
+  try {
+    const sourceSnapshot = path.join(workRoot, "source");
+    const nativeScratch = path.join(workRoot, "swift-build");
+    await mkdir(sourceSnapshot, { mode: 0o700 });
+    for (const relativePath of sourceSnapshotInputs) {
+      const source = path.join(sourceRoot, ...relativePath.split("/"));
+      const destination = path.join(sourceSnapshot, ...relativePath.split("/"));
+      await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+      await cp(source, destination, {
+        recursive: true,
+        dereference: false,
+        errorOnExist: true,
+        force: false,
+        preserveTimestamps: false,
+      });
+    }
+
+    const buildEnvironment = commandEnvironment();
+    await runCommand("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], {
+      cwd: sourceSnapshot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NODE_BUILD_DEPENDENCIES_INVALID",
+    });
+    await runCommand("npm", ["run", "build"], {
+      cwd: sourceSnapshot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NODE_BUILD_FAILED",
+    });
+
+    await copyFile(path.join(sourceSnapshot, "package.json"), path.join(payloadRoot, "package.json"));
+    await copyFile(
+      path.join(sourceSnapshot, "package-lock.json"),
+      path.join(payloadRoot, "package-lock.json"),
+    );
+    await cp(path.join(sourceSnapshot, "dist"), path.join(payloadRoot, "dist"), {
+      recursive: true,
+      dereference: false,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: false,
+    });
+    await mkdir(path.join(payloadRoot, "config"), { mode: 0o700 });
+    await copyFile(
+      path.join(sourceSnapshot, "config", "automation-daily-care.config.toml"),
+      path.join(payloadRoot, "config", "automation-daily-care.config.toml"),
+    );
+    await copyFile(
+      path.join(sourceSnapshot, "config", "automation-restricted.config.toml"),
+      path.join(payloadRoot, "config", "automation-restricted.config.toml"),
+    );
+    await mkdir(path.join(payloadRoot, "prompts"), { mode: 0o700 });
+    await copyFile(
+      path.join(sourceSnapshot, "prompts", "automation-daily-care-v1.md"),
+      path.join(payloadRoot, "prompts", "automation-daily-care-v1.md"),
+    );
+    await copyFile(
+      path.join(sourceSnapshot, "prompts", "automation-direct-reply-v1.md"),
+      path.join(payloadRoot, "prompts", "automation-direct-reply-v1.md"),
+    );
+    await cp(path.join(sourceSnapshot, "runtime-bin"), path.join(payloadRoot, "bin"), {
+      recursive: true,
+      dereference: false,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: false,
+    });
+    await Promise.all([
+      chmod(path.join(payloadRoot, "bin", "chat-assistant-supervisor"), 0o555),
+      chmod(path.join(payloadRoot, "bin", "daily-care-supervisor"), 0o555),
+      chmod(path.join(payloadRoot, "bin", "daily-care-test"), 0o555),
+      chmod(path.join(payloadRoot, "bin", "official-research"), 0o555),
+    ]);
+    await runCommand(
+      "npm",
+      ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
+      {
+        cwd: payloadRoot,
+        environment: buildEnvironment,
+        errorCode: "RELEASE_NODE_DEPENDENCIES_INVALID",
+      },
+    );
+
+    const hostArchitecture = (await runCommand("/usr/bin/uname", ["-m"], {
+      cwd: workRoot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NATIVE_PLATFORM_UNSUPPORTED",
+    })).stdout.trim();
+    if (hostArchitecture !== "arm64" || process.arch !== "arm64") {
+      throw new Error("RELEASE_NATIVE_PLATFORM_UNSUPPORTED");
+    }
+
+    const nativePackage = path.join(sourceSnapshot, "native", "WechatVisionBridge");
+    const swiftArguments = [
+      "build",
+      "--package-path",
+      nativePackage,
+      "--scratch-path",
+      nativeScratch,
+      "-c",
+      "release",
+      "--arch",
+      "arm64",
+      "--product",
+      "WechatVisionBridge",
+    ];
+    await runCommand("/usr/bin/swift", swiftArguments, {
+      cwd: workRoot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NATIVE_BUILD_FAILED",
+    });
+    const binPathResult = await runCommand(
+      "/usr/bin/swift",
+      [...swiftArguments, "--show-bin-path"],
+      {
+        cwd: workRoot,
+        environment: buildEnvironment,
+        errorCode: "RELEASE_NATIVE_BUILD_FAILED",
+      },
+    );
+    const nativeBuildRoot = lastNonemptyLine(binPathResult.stdout);
+    const builtNative = path.join(nativeBuildRoot, "WechatVisionBridge");
+    const packagedNative = path.join(payloadRoot, ...NATIVE_RUNTIME_PATH.split("/"));
+    await mkdir(path.dirname(packagedNative), { recursive: true, mode: 0o700 });
+    await copyFile(builtNative, packagedNative);
+    await removeNonSystemRpaths(packagedNative, workRoot, buildEnvironment);
+    await runCommand("/usr/bin/codesign", ["--force", "--sign", "-", packagedNative], {
+      cwd: workRoot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NATIVE_CODESIGN_FAILED",
+    });
+
+    const validationEnvironment = runtimeValidationEnvironment({
+      HOME: workRoot,
+      TMPDIR: workRoot,
+      PATH: buildEnvironment.PATH,
+    });
+    const native = await validateNativeExecutable(
+      packagedNative,
+      workRoot,
+      validationEnvironment,
+    );
+    const dependencyTree = await inspectProductionDependencies(
+      payloadRoot,
+      validationEnvironment,
+    );
+    const packageDocument = parseJsonDocument(
+      await readFile(path.join(payloadRoot, "package.json"), "utf8"),
+      "RELEASE_PACKAGE_JSON_INVALID",
+    );
+    const lockDocument = parseJsonDocument(
+      await readFile(path.join(payloadRoot, "package-lock.json"), "utf8"),
+      "RELEASE_PACKAGE_LOCK_INVALID",
+    );
+    const npmVersion = (await runCommand("npm", ["--version"], {
+      cwd: workRoot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NODE_DEPENDENCIES_INVALID",
+    })).stdout.trim();
+    const swiftVersion = (await runCommand("/usr/bin/swift", ["--version"], {
+      cwd: workRoot,
+      environment: buildEnvironment,
+      errorCode: "RELEASE_NATIVE_BUILD_FAILED",
+    })).stdout.trim();
+    const nativeSourceSha256 = await sourceTreeSha256(
+      path.join(sourceSnapshot, "native", "WechatVisionBridge", "Sources"),
+    );
+
+    await normalizePayloadModes(payloadRoot);
+    const manifest = await createPayloadManifest({
+      payloadRoot,
+      provenance: {
+        architecture: "arm64",
+        bridgeProtocolVersion,
+        lockfileVersion: lockDocument.lockfileVersion,
+        nativeConfiguration: "release",
+        nativeProtocolVersion,
+        nodeEngine: packageDocument.engines?.node,
+        nodeVersion: process.version,
+        npmVersion,
+        nativeReceipt: {
+          binaryPath: NATIVE_RUNTIME_PATH,
+          binarySha256: native.binarySha256,
+          codesign: native.codesign,
+          configuration: "release",
+          hostArchitecture,
+          linkedLibraries: native.linkedLibraries,
+          machoArchitecture: native.architecture,
+          protocolVersion: native.protocolVersion,
+          rpaths: native.rpaths,
+          sourceSha256: nativeSourceSha256,
+          swiftVersion,
+        },
+        packageVersion: packageDocument.version,
+        productionDependencyTreeSha256: sha256(canonicalManifestBytes(dependencyTree)),
+        runtimeContractVersion,
+        swiftVersion,
+      },
+    });
+    await Promise.all([
+      chmod(path.join(payloadRoot, PAYLOAD_MANIFEST_FILENAME), 0o444),
+      chmod(path.join(payloadRoot, PAYLOAD_MANIFEST_SHA256_FILENAME), 0o444),
+      chmod(payloadRoot, 0o555),
+    ]);
+    return {
+      manifestSha256: manifest.manifestSha256,
+      native: {
+        architecture: native.architecture,
+        configuration: "release",
+        protocolVersion: native.protocolVersion,
+      },
+    };
+  } catch (error) {
+    throw error instanceof Error && error.message.startsWith("RELEASE_")
+      ? error
+      : new Error("RELEASE_PAYLOAD_BUILD_FAILED", { cause: error });
+  }
+}
+
+export async function validateReleasePayload(options) {
+  const payloadRoot = path.resolve(options.payloadRoot);
+  const manifest = await validatePayloadManifest({ payloadRoot });
+  await assertRequiredPayloadFiles(payloadRoot, manifest.provenance.runtimeContractVersion);
+  const probeRoot = await mkdtemp(path.join(os.tmpdir(), "release-bridge-probe-"));
+  try {
+    const validationHome = path.join(probeRoot, "validation-home");
+    await mkdir(validationHome, { mode: 0o700 });
+    const environment = runtimeValidationEnvironment({
+      HOME: validationHome,
+      TMPDIR: probeRoot,
+    });
+    const dependencyTree = await inspectProductionDependencies(payloadRoot, environment);
+    const problems = Array.isArray(dependencyTree.problems) ? dependencyTree.problems : [];
+    await validateCriticalImports(
+      payloadRoot,
+      environment,
+      manifest.provenance.runtimeContractVersion,
+    );
+    const native = await validateNativeExecutable(
+      path.join(payloadRoot, ...NATIVE_RUNTIME_PATH.split("/")),
+      payloadRoot,
+      environment,
+    );
+    const [hostArchitecture, swiftVersion] = await Promise.all([
+      runCommand("/usr/bin/uname", ["-m"], {
+        cwd: payloadRoot,
+        environment,
+        errorCode: "RELEASE_NATIVE_PROVENANCE_INVALID",
+      }).then(({ stdout }) => stdout.trim()),
+      runCommand("/usr/bin/swift", ["--version"], {
+        cwd: payloadRoot,
+        environment,
+        errorCode: "RELEASE_NATIVE_PROVENANCE_INVALID",
+      }).then(({ stdout }) => stdout.trim()),
+    ]);
+    assertNativeProvenance(manifest.provenance, native, hostArchitecture, swiftVersion);
+    const bridge = await runIsolatedBridge(payloadRoot, path.join(probeRoot, "bridge"));
+    return {
+      manifestSha256: manifest.manifestSha256,
+      bridgeProtocolVersion: bridge.protocolVersion,
+      nativeProtocolVersion: native.protocolVersion,
+      productionDependencyProblems: problems.length,
+    };
+  } finally {
+    await rm(probeRoot, { recursive: true, force: true });
+  }
+}
+
+export async function smokeReleasePayload(options) {
+  const payloadRoot = path.resolve(options.payloadRoot);
+  const smokeRoot = path.resolve(options.smokeRoot);
+  const productionRuntimeRoot = path.resolve(options.productionRuntimeRoot);
+  const [resolvedSmokeRoot, resolvedProductionRuntimeRoot] = await Promise.all([
+    resolveProspectiveRealPath(smokeRoot),
+    resolveProspectiveRealPath(productionRuntimeRoot),
+  ]);
+  if (
+    pathsOverlap(resolvedSmokeRoot, resolvedProductionRuntimeRoot)
+  ) {
+    throw new Error("RELEASE_SMOKE_ROOT_OVERLAPS_PRODUCTION");
+  }
+  await validatePayloadManifest({ payloadRoot });
+  const before = await inspectProductionMaintenanceLease(options);
+  await createEmptyDirectory(smokeRoot, "RELEASE_SMOKE_ROOT_NOT_EMPTY");
+  const native = await validateNativeExecutable(
+    path.join(payloadRoot, ...NATIVE_RUNTIME_PATH.split("/")),
+    smokeRoot,
+    runtimeValidationEnvironment({
+      HOME: path.join(smokeRoot, "validation-home"),
+      TMPDIR: smokeRoot,
+    }),
+  );
+  const bridge = await runIsolatedBridge(payloadRoot, smokeRoot);
+  const after = await inspectProductionMaintenanceLease(options);
+  if (!sameMaintenanceSnapshot(before, after)) {
+    throw new Error("RELEASE_PRODUCTION_PATH_TOUCHED");
+  }
+  return {
+    bridgeProtocolVersion: bridge.protocolVersion,
+    nativeProtocolVersion: native.protocolVersion,
+    lockObserved: bridge.lockObserved,
+    lockReleased: bridge.lockReleased,
+    productionWrites: 0,
+  };
+}
+
+async function assertSourceRoot(sourceRoot) {
+  const identity = await lstat(sourceRoot).catch((error) => {
+    throw new Error("RELEASE_SOURCE_ROOT_INVALID", { cause: error });
+  });
+  if (!identity.isDirectory() || identity.isSymbolicLink()) {
+    throw new Error("RELEASE_SOURCE_ROOT_INVALID");
+  }
+  await Promise.all(sourceSnapshotInputs.map(async (relativePath) => {
+    const input = path.join(sourceRoot, ...relativePath.split("/"));
+    await lstat(input).catch((error) => {
+      throw new Error("RELEASE_SOURCE_INPUT_MISSING", { cause: error });
+    });
+  }));
+}
+
+async function createEmptyDirectory(directory, errorCode) {
+  try {
+    await mkdir(directory, { mode: 0o700 });
+    return;
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+  }
+  const identity = await lstat(directory);
+  if (!identity.isDirectory() || identity.isSymbolicLink()) throw new Error(errorCode);
+  if ((await readdir(directory)).length !== 0) throw new Error(errorCode);
+}
+
+function commandEnvironment(overrides = {}) {
+  const environment = { ...process.env, ...overrides };
+  delete environment.NODE_PATH;
+  delete environment.NODE_OPTIONS;
+  return environment;
+}
+
+function runtimeValidationEnvironment(overrides = {}) {
+  const environment = {
+    HOME: overrides.HOME,
+    LANG: overrides.LANG ?? "en_US.UTF-8",
+    LC_ALL: overrides.LC_ALL ?? "C",
+    PATH: overrides.PATH ?? process.env.PATH ?? "/usr/bin:/bin",
+    TMPDIR: overrides.TMPDIR,
+  };
+  return Object.fromEntries(
+    Object.entries(environment).filter(([, value]) => (
+      typeof value === "string" && value.length > 0
+    )),
+  );
+}
+
+async function runCommand(executable, arguments_, options) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      executable,
+      arguments_,
+      {
+        cwd: options.cwd,
+        env: options.environment,
+        encoding: "utf8",
+        maxBuffer: 32 * 1_024 * 1_024,
+        timeout: options.timeoutMs ?? commandTimeoutMs,
+      },
+      (error, stdout, stderr) => {
+        if (error !== null) {
+          reject(new Error(options.errorCode, {
+            cause: new Error(`${error.message}\n${stderr}`),
+          }));
+          return;
+        }
+        resolve({ stdout, stderr });
+      },
+    );
+  });
+}
+
+function lastNonemptyLine(value) {
+  const lines = value.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const result = lines.at(-1);
+  if (result === undefined || !path.isAbsolute(result)) {
+    throw new Error("RELEASE_NATIVE_BUILD_FAILED");
+  }
+  return result;
+}
+
+async function removeNonSystemRpaths(nativePath, cwd, environment) {
+  const before = await runCommand("/usr/bin/otool", ["-l", nativePath], {
+    cwd,
+    environment,
+    errorCode: "RELEASE_NATIVE_INVALID",
+  });
+  for (const rpath of parseRpaths(before.stdout)) {
+    if (isAllowedRpath(rpath)) continue;
+    await runCommand("/usr/bin/install_name_tool", ["-delete_rpath", rpath, nativePath], {
+      cwd,
+      environment,
+      errorCode: "RELEASE_NATIVE_RPATH_INVALID",
+    });
+  }
+}
+
+async function validateNativeExecutable(nativePath, cwd, environment) {
+  const identity = await lstat(nativePath).catch((error) => {
+    throw new Error("RELEASE_NATIVE_INVALID", { cause: error });
+  });
+  if (!identity.isFile() || identity.isSymbolicLink() || (identity.mode & 0o111) === 0) {
+    throw new Error("RELEASE_NATIVE_INVALID");
+  }
+  const [fileResult, architectureResult, versionResult, librariesResult, loadCommandsResult] =
+    await Promise.all([
+      runCommand("/usr/bin/file", [nativePath], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+      runCommand("/usr/bin/lipo", ["-archs", nativePath], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+      runCommand(nativePath, ["version"], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+      runCommand("/usr/bin/otool", ["-L", nativePath], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+      runCommand("/usr/bin/otool", ["-l", nativePath], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+      runCommand("/usr/bin/codesign", ["--verify", "--strict", "--verbose=2", nativePath], {
+        cwd,
+        environment,
+        errorCode: "RELEASE_NATIVE_INVALID",
+      }),
+    ]);
+  if (
+    !fileResult.stdout.includes("Mach-O 64-bit executable arm64")
+    || architectureResult.stdout.trim() !== "arm64"
+  ) {
+    throw new Error("RELEASE_NATIVE_ARCHITECTURE_INVALID");
+  }
+  const version = parseJsonDocument(versionResult.stdout, "RELEASE_NATIVE_PROTOCOL_INVALID");
+  if (
+    !isPlainRecord(version)
+    || Object.keys(version).length !== 1
+    || version.protocolVersion !== nativeProtocolVersion
+  ) {
+    throw new Error("RELEASE_NATIVE_PROTOCOL_INVALID");
+  }
+  const linkedLibraries = parseLinkedLibraries(librariesResult.stdout);
+  for (const library of linkedLibraries) {
+    if (!library.startsWith("/usr/lib/") && !library.startsWith("/System/Library/")) {
+      throw new Error("RELEASE_NATIVE_DEPENDENCY_INVALID");
+    }
+  }
+  const rpaths = parseRpaths(loadCommandsResult.stdout);
+  if (rpaths.some((rpath) => !isAllowedRpath(rpath))) {
+    throw new Error("RELEASE_NATIVE_RPATH_INVALID");
+  }
+  return {
+    architecture: "arm64",
+    binarySha256: sha256(await readFile(nativePath)),
+    codesign: "adhoc-verified",
+    linkedLibraries,
+    protocolVersion: nativeProtocolVersion,
+    rpaths,
+  };
+}
+
+function assertNativeProvenance(provenance, native, hostArchitecture, swiftVersion) {
+  assertPlainObject(provenance, "RELEASE_NATIVE_PROVENANCE_INVALID");
+  const receipt = provenance.nativeReceipt;
+  assertPlainObject(receipt, "RELEASE_NATIVE_PROVENANCE_INVALID");
+  assertExactKeys(receipt, [
+    "binaryPath",
+    "binarySha256",
+    "codesign",
+    "configuration",
+    "hostArchitecture",
+    "linkedLibraries",
+    "machoArchitecture",
+    "protocolVersion",
+    "rpaths",
+    "sourceSha256",
+    "swiftVersion",
+  ]);
+  if (
+    receipt.binaryPath !== NATIVE_RUNTIME_PATH
+    || receipt.binarySha256 !== native.binarySha256
+    || receipt.codesign !== native.codesign
+    || receipt.configuration !== "release"
+    || receipt.hostArchitecture !== hostArchitecture
+    || receipt.machoArchitecture !== native.architecture
+    || receipt.protocolVersion !== native.protocolVersion
+    || receipt.swiftVersion !== swiftVersion
+    || !sha256Pattern.test(receipt.sourceSha256)
+    || !Array.isArray(receipt.linkedLibraries)
+    || !Array.isArray(receipt.rpaths)
+    || JSON.stringify(receipt.linkedLibraries) !== JSON.stringify(native.linkedLibraries)
+    || JSON.stringify(receipt.rpaths) !== JSON.stringify(native.rpaths)
+  ) {
+    throw new Error("RELEASE_NATIVE_PROVENANCE_INVALID");
+  }
+}
+
+async function sourceTreeSha256(root) {
+  const records = [];
+  async function visit(directory, relativeDirectory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => compareUtf8(left.name, right.name));
+    for (const entry of entries) {
+      const relativePath = relativeDirectory === ""
+        ? entry.name
+        : `${relativeDirectory}/${entry.name}`;
+      validateRelativePayloadPath(relativePath);
+      const absolutePath = path.join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        await visit(absolutePath, relativePath);
+      } else if (entry.isFile() && !entry.isSymbolicLink()) {
+        records.push({ path: relativePath, sha256: sha256(await readFile(absolutePath)) });
+      } else {
+        throw new Error("RELEASE_NATIVE_SOURCE_INVALID");
+      }
+    }
+  }
+  await visit(root, "");
+  if (records.length === 0) throw new Error("RELEASE_NATIVE_SOURCE_INVALID");
+  return sha256(Buffer.from(JSON.stringify(records), "utf8"));
+}
+
+function parseRpaths(output) {
+  const lines = output.split(/\r?\n/u);
+  const rpaths = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index]?.trim() !== "cmd LC_RPATH") continue;
+    for (let offset = 1; offset <= 4 && index + offset < lines.length; offset += 1) {
+      const match = /^\s*path\s+(.+?)\s+\(offset\s+\d+\)\s*$/u.exec(lines[index + offset]);
+      if (match !== null) {
+        rpaths.push(match[1]);
+        break;
+      }
+    }
+  }
+  return rpaths;
+}
+
+function isAllowedRpath(rpath) {
+  return rpath === "/usr/lib/swift" || rpath === "@loader_path";
+}
+
+function parseLinkedLibraries(output) {
+  return output.split(/\r?\n/u).slice(1).map((line) => line.trim()).filter(Boolean)
+    .map((line) => line.replace(/\s+\(compatibility version.*$/u, ""));
+}
+
+async function inspectProductionDependencies(payloadRoot, environment) {
+  let result;
+  try {
+    result = await runCommand("npm", ["ls", "--omit=dev", "--all", "--json"], {
+      cwd: payloadRoot,
+      environment,
+      errorCode: "RELEASE_NODE_DEPENDENCIES_INVALID",
+    });
+  } catch (error) {
+    throw new Error("RELEASE_NODE_DEPENDENCIES_INVALID", { cause: error });
+  }
+  const tree = parseJsonDocument(result.stdout, "RELEASE_NODE_DEPENDENCIES_INVALID");
+  if (!isPlainRecord(tree)) throw new Error("RELEASE_NODE_DEPENDENCIES_INVALID");
+  const problems = tree.problems;
+  if (problems !== undefined && (!Array.isArray(problems) || problems.length > 0)) {
+    throw new Error("RELEASE_NODE_DEPENDENCIES_INVALID");
+  }
+  return tree;
+}
+
+function parseJsonDocument(serialized, errorCode) {
+  try {
+    return JSON.parse(serialized);
+  } catch (error) {
+    throw new Error(errorCode, { cause: error });
+  }
+}
+
+async function normalizePayloadModes(payloadRoot) {
+  const entries = await collectPayloadEntries(payloadRoot);
+  const files = entries.filter((entry) => entry.type === "file");
+  for (const entry of files) {
+    const executable = (entry.mode & 0o111) !== 0;
+    await chmod(
+      path.join(payloadRoot, ...entry.path.split("/")),
+      executable ? 0o555 : 0o444,
+    );
+  }
+  const directories = entries.filter((entry) => entry.type === "directory")
+    .sort((left, right) => right.path.split("/").length - left.path.split("/").length);
+  for (const entry of directories) {
+    await chmod(path.join(payloadRoot, ...entry.path.split("/")), 0o555);
+  }
+}
+
+async function assertRequiredPayloadFiles(payloadRoot, contractVersion) {
+  const required = [
+    "package.json",
+    "package-lock.json",
+    "dist/src/mcp/live-cli-bridge-main.js",
+    "dist/src/mcp/live-cli-bridge.js",
+    "dist/src/mcp/live-bootstrap.js",
+    "dist/src/mcp/live-server.js",
+    "dist/src/mcp/live-supervisor-mcp-main.js",
+    "dist/src/mcp/live-supervisor-mcp-server.js",
+    "dist/src/mcp/daily-care-bootstrap.js",
+    "dist/src/mcp/daily-care-mcp-server.js",
+    "dist/src/mcp/daily-care-runtime.js",
+    "dist/src/mcp/daily-care-session.js",
+    "dist/src/mcp/daily-care-supervisor-main.js",
+    "dist/src/mcp/daily-care-test-main.js",
+    "dist/src/mcp/official-research-server-main.js",
+    "dist/src/mcp/official-research-server.js",
+    "bin/chat-assistant-supervisor",
+    "bin/daily-care-supervisor",
+    "bin/daily-care-test",
+    "bin/official-research",
+    "config/automation-daily-care.config.toml",
+    "config/automation-restricted.config.toml",
+    "prompts/automation-daily-care-v1.md",
+    "prompts/automation-direct-reply-v1.md",
+    "dist/src/artifacts/travel-demo-job.js",
+    "node_modules/zod/package.json",
+    "node_modules/@modelcontextprotocol/sdk/package.json",
+    NATIVE_RUNTIME_PATH,
+  ];
+  if (contractVersion === runtimeContractVersion) {
+    required.push(
+      "dist/src/mcp/fixed-heartbeat-supervisor.js",
+      "dist/src/mcp/fixed-heartbeat-supervisor-main.js",
+    );
+  }
+  await Promise.all(required.map(async (relativePath) => {
+    const identity = await lstat(path.join(payloadRoot, ...relativePath.split("/"))).catch((error) => {
+      throw new Error("RELEASE_REQUIRED_PAYLOAD_MISSING", { cause: error });
+    });
+    if (!identity.isFile() || identity.isSymbolicLink()) {
+      throw new Error("RELEASE_REQUIRED_PAYLOAD_MISSING");
+    }
+  }));
+}
+
+async function validateCriticalImports(payloadRoot, environment, contractVersion) {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "release-import-check-"));
+  try {
+    const home = path.join(temporaryRoot, "home");
+    const cwd = path.join(temporaryRoot, "cwd");
+    await Promise.all([
+      mkdir(home, { mode: 0o700 }),
+      mkdir(cwd, { mode: 0o700 }),
+    ]);
+    const targets = [
+      "dist/src/artifacts/travel-demo-job.js",
+      "dist/src/mcp/live-cli-bridge.js",
+      "dist/src/mcp/live-bootstrap.js",
+      "dist/src/mcp/live-server.js",
+      "dist/src/mcp/live-supervisor-mcp-server.js",
+      "dist/src/mcp/daily-care-bootstrap.js",
+      "dist/src/mcp/daily-care-mcp-server.js",
+      "dist/src/mcp/daily-care-runtime.js",
+      "dist/src/mcp/daily-care-session.js",
+      "dist/src/mcp/daily-care-supervisor-main.js",
+      "dist/src/mcp/official-research-server.js",
+    ];
+    if (contractVersion === runtimeContractVersion) {
+      targets.push(
+        "dist/src/mcp/fixed-heartbeat-supervisor.js",
+        "dist/src/mcp/fixed-heartbeat-supervisor-main.js",
+      );
+    }
+    const urls = targets.map((relativePath) => pathToFileURL(
+      path.join(payloadRoot, ...relativePath.split("/")),
+    ).href);
+    const source = `for (const target of ${JSON.stringify(urls)}) await import(target);`;
+    await runCommand(process.execPath, ["--input-type=module", "--eval", source], {
+      cwd,
+      environment: runtimeValidationEnvironment({
+        HOME: home,
+        TMPDIR: temporaryRoot,
+        PATH: environment.PATH,
+      }),
+      errorCode: "RELEASE_NODE_IMPORT_FAILED",
+    });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+async function runIsolatedBridge(payloadRoot, smokeRoot) {
+  const home = path.join(smokeRoot, "home");
+  const cwd = path.join(smokeRoot, "cwd");
+  const temporaryDirectory = path.join(smokeRoot, "temp");
+  await Promise.all([
+    mkdir(home, { recursive: true, mode: 0o700 }),
+    mkdir(cwd, { recursive: true, mode: 0o700 }),
+    mkdir(temporaryDirectory, { recursive: true, mode: 0o700 }),
+  ]);
+  const runtimeRoot = path.join(home, "Desktop", "聊天助手");
+  const lockPath = path.join(runtimeRoot, "state", "live-operation.lock");
+  const entry = path.join(payloadRoot, "dist", "src", "mcp", "live-cli-bridge-main.js");
+  const child = spawn(process.execPath, [entry], {
+    cwd,
+    env: {
+      CHAT_ASSISTANT_MODE: "observe",
+      HOME: home,
+      LANG: "en_US.UTF-8",
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      TMPDIR: temporaryDirectory,
+    },
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stderr.setEncoding("utf8");
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  let completed = false;
+  try {
+    const ready = await readBridgeResponse(iterator);
+    if (
+      !isPlainRecord(ready)
+      || ready.ok !== true
+      || ready.type !== "ready"
+      || ready.protocolVersion !== bridgeProtocolVersion
+      || ready.active !== true
+      || Object.keys(ready).sort().join(",") !== "active,ok,protocolVersion,type"
+    ) {
+      throw new Error("RELEASE_BRIDGE_PROTOCOL_INVALID");
+    }
+    const lockIdentity = await lstat(lockPath);
+    if (!lockIdentity.isFile() || lockIdentity.isSymbolicLink()) {
+      throw new Error("RELEASE_SMOKE_LOCK_NOT_OBSERVED");
+    }
+    await writeBridgeCommand(child, { op: "close" });
+    const closed = await readBridgeResponse(iterator);
+    if (
+      !isPlainRecord(closed)
+      || closed.ok !== true
+      || !isPlainRecord(closed.result)
+      || closed.result.closed !== true
+    ) {
+      throw new Error("RELEASE_BRIDGE_CLOSE_FAILED");
+    }
+    child.stdin.end();
+    await assertChildExit(child, stderr);
+    completed = true;
+    await assertPathMissing(lockPath, "RELEASE_SMOKE_LOCK_NOT_RELEASED");
+    return {
+      protocolVersion: bridgeProtocolVersion,
+      lockObserved: true,
+      lockReleased: true,
+    };
+  } finally {
+    lines.close();
+    if (!completed && child.exitCode === null && child.signalCode === null) {
+      if (child.stdin.writable) {
+        child.stdin.write(`${JSON.stringify({ op: "close" })}\n`);
+        child.stdin.end();
+      }
+      try {
+        await waitForExit(child, 2_000);
+      } catch {
+        child.kill("SIGTERM");
+        try {
+          await waitForExit(child, 2_000);
+        } catch {
+          child.kill("SIGKILL");
+          await waitForExit(child, 2_000);
+        }
+      }
+      await assertPathMissing(lockPath, "RELEASE_SMOKE_LOCK_NOT_RELEASED");
+    }
+  }
+}
+
+async function readBridgeResponse(iterator) {
+  const next = await withTimeout(iterator.next(), bridgeTimeoutMs, "RELEASE_BRIDGE_TIMEOUT");
+  if (next.done) throw new Error("RELEASE_BRIDGE_CLOSED_EARLY");
+  return parseJsonDocument(next.value, "RELEASE_BRIDGE_PROTOCOL_INVALID");
+}
+
+async function writeBridgeCommand(child, command) {
+  if (!child.stdin.write(`${JSON.stringify(command)}\n`, "utf8")) {
+    await once(child.stdin, "drain");
+  }
+}
+
+async function assertChildExit(child, stderr) {
+  const [code, signal] = await waitForExit(child, bridgeTimeoutMs);
+  if (code !== 0 || signal !== null) {
+    throw new Error("RELEASE_BRIDGE_EXIT_INVALID", {
+      cause: new Error(`code=${String(code)} signal=${String(signal)} ${stderr}`),
+    });
+  }
+}
+
+async function waitForExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return [child.exitCode, child.signalCode];
+  }
+  return withTimeout(once(child, "exit"), timeoutMs, "RELEASE_BRIDGE_TIMEOUT");
+}
+
+function withTimeout(promise, timeoutMs, errorCode) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(errorCode)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function assertPathMissing(candidate, errorCode) {
+  try {
+    await lstat(candidate);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(errorCode);
+}
+
+async function inspectProductionMaintenanceLease(options) {
+  const expected = options.productionMaintenanceLease;
+  if (!isPlainRecord(expected)) throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  const expectedPath = path.join(
+    path.resolve(options.productionRuntimeRoot),
+    "state",
+    "live-operation.lock",
+  );
+  if (path.resolve(expected.path) !== expectedPath) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+  const identity = await lstat(expectedPath).catch((error) => {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+  });
+  if (
+    !identity.isFile()
+    || identity.isSymbolicLink()
+    || String(identity.dev) !== expected.device
+    || String(identity.ino) !== expected.inode
+  ) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+  const contents = await readExactRegularFile(expectedPath, identity);
+  const metadata = parseJsonDocument(
+    contents.toString("utf8"),
+    "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS",
+  );
+  if (
+    !isPlainRecord(metadata)
+    || metadata.purpose !== "release-maintenance"
+    || metadata.maintenanceNonce !== expected.nonce
+    || metadata.txid !== expected.txid
+  ) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+  return {
+    contents: contents.toString("base64"),
+    device: String(identity.dev),
+    inode: String(identity.ino),
+    mode: identity.mode,
+    modifiedAt: identity.mtimeMs,
+    size: identity.size,
+  };
+}
+
+function sameMaintenanceSnapshot(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isPlainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNodeError(error) {
+  return error instanceof Error && "code" in error;
+}
+
+export async function createPayloadManifest(options) {
+  const payloadRoot = path.resolve(options.payloadRoot);
+  await assertPayloadRoot(payloadRoot);
+  assertPlainObject(options.provenance, "RELEASE_MANIFEST_INVALID");
+  const entries = await collectPayloadEntries(payloadRoot);
+  const manifest = {
+    manifestVersion: PAYLOAD_MANIFEST_VERSION,
+    provenance: normalizeJsonValue(options.provenance),
+    entries,
+  };
+  const manifestBytes = canonicalManifestBytes(manifest);
+  const manifestSha256 = sha256(manifestBytes);
+
+  await atomicWrite(
+    payloadRoot,
+    PAYLOAD_MANIFEST_FILENAME,
+    manifestBytes,
+  );
+  await atomicWrite(
+    payloadRoot,
+    PAYLOAD_MANIFEST_SHA256_FILENAME,
+    Buffer.from(`${manifestSha256}\n`, "utf8"),
+  );
+
+  return { manifestSha256 };
+}
+
+export async function validatePayloadManifest(options) {
+  const payloadRoot = path.resolve(options.payloadRoot);
+  const rootIdentity = await assertPayloadRoot(payloadRoot);
+  if ((rootIdentity.mode & 0o777) !== 0o555) {
+    throw new Error("RELEASE_PAYLOAD_MODE_POLICY_INVALID");
+  }
+  const manifestBytes = await readMetadataFile(
+    path.join(payloadRoot, PAYLOAD_MANIFEST_FILENAME),
+  );
+  const sidecarBytes = await readMetadataFile(
+    path.join(payloadRoot, PAYLOAD_MANIFEST_SHA256_FILENAME),
+  );
+  const sidecar = sidecarBytes.toString("utf8");
+  if (!/^[a-f0-9]{64}\n$/u.test(sidecar)) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+
+  const manifestSha256 = sha256(manifestBytes);
+  if (sidecar !== `${manifestSha256}\n`) {
+    throw new Error("RELEASE_MANIFEST_HASH_MISMATCH");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(manifestBytes.toString("utf8"));
+  } catch (error) {
+    throw new Error("RELEASE_MANIFEST_INVALID", { cause: error });
+  }
+  assertManifest(parsed);
+  if (!manifestBytes.equals(canonicalManifestBytes(parsed))) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+
+  const actualEntries = await collectPayloadEntries(payloadRoot);
+  const expectedByPath = new Map(parsed.entries.map((entry) => [entry.path, entry]));
+  const actualByPath = new Map(actualEntries.map((entry) => [entry.path, entry]));
+  if (
+    expectedByPath.size !== actualByPath.size
+    || [...expectedByPath.keys()].some((entryPath) => !actualByPath.has(entryPath))
+  ) {
+    throw new Error("RELEASE_PAYLOAD_SET_MISMATCH");
+  }
+
+  for (const [entryPath, expected] of expectedByPath) {
+    const actual = actualByPath.get(entryPath);
+    if (actual.type !== expected.type) {
+      throw new Error("RELEASE_PAYLOAD_ENTRY_INVALID");
+    }
+    if (expected.type === "file" && actual.sha256 !== expected.sha256) {
+      throw new Error("RELEASE_PAYLOAD_HASH_MISMATCH");
+    }
+    if (!sameEntry(expected, actual)) {
+      throw new Error("RELEASE_PAYLOAD_ENTRY_INVALID");
+    }
+    assertPayloadEntryMode(actual);
+  }
+  const finalRootIdentity = await lstat(payloadRoot);
+  if (
+    !finalRootIdentity.isDirectory()
+    || finalRootIdentity.isSymbolicLink()
+    || finalRootIdentity.dev !== rootIdentity.dev
+    || finalRootIdentity.ino !== rootIdentity.ino
+    || finalRootIdentity.mode !== rootIdentity.mode
+    || finalRootIdentity.nlink !== rootIdentity.nlink
+  ) {
+    throw new Error("RELEASE_PAYLOAD_ROOT_INVALID");
+  }
+
+  return {
+    ok: true,
+    manifestSha256,
+    entryCount: actualEntries.length,
+    provenance: parsed.provenance,
+  };
+}
+
+export function canonicalManifestBytes(manifest) {
+  return Buffer.from(`${JSON.stringify(normalizeJsonValue(manifest), null, 2)}\n`, "utf8");
+}
+
+export function validateRelativePayloadPath(relativePath) {
+  if (
+    typeof relativePath !== "string"
+    || relativePath.length === 0
+    || relativePath.includes("\0")
+    || relativePath.includes("\\")
+    || path.posix.isAbsolute(relativePath)
+    || relativePath.normalize("NFC") !== relativePath
+  ) {
+    throw new Error("RELEASE_PAYLOAD_PATH_UNSAFE");
+  }
+  const segments = relativePath.split("/");
+  if (segments.some((segment) => /^\.env(?:\..+)?$/u.test(segment))) {
+    throw new Error("RELEASE_PAYLOAD_SECRET_FILE_FORBIDDEN");
+  }
+  if (
+    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    || path.posix.normalize(relativePath) !== relativePath
+    || !/^[A-Za-z0-9._@+/-]+$/u.test(relativePath)
+  ) {
+    throw new Error("RELEASE_PAYLOAD_PATH_UNSAFE");
+  }
+  return relativePath;
+}
+
+async function collectPayloadEntries(payloadRoot) {
+  const rootRealPath = await realpath(payloadRoot);
+  const entries = [];
+  const foldedPaths = new Set();
+
+  async function visit(directory, relativeDirectory) {
+    const names = await readdir(directory);
+    names.sort(compareUtf8);
+    for (const name of names) {
+      if (relativeDirectory === "" && metadataFilenames.has(name)) continue;
+      const relativePath = validateRelativePayloadPath(
+        relativeDirectory === "" ? name : `${relativeDirectory}/${name}`,
+      );
+      const folded = relativePath.toLowerCase();
+      if (foldedPaths.has(folded)) {
+        throw new Error("RELEASE_PAYLOAD_PATH_COLLISION");
+      }
+      foldedPaths.add(folded);
+
+      const absolutePath = path.join(payloadRoot, ...relativePath.split("/"));
+      const identity = await lstat(absolutePath);
+      const mode = identity.mode & 0o777;
+      if (identity.isDirectory()) {
+        await assertRealPathInsideRoot(rootRealPath, absolutePath);
+        entries.push({ path: relativePath, type: "directory", size: 0, mode });
+        await visit(absolutePath, relativePath);
+        const finalIdentity = await lstat(absolutePath);
+        assertUnchangedIdentity(identity, finalIdentity, "directory");
+      } else if (identity.isFile()) {
+        if (identity.nlink !== 1) throw new Error("RELEASE_PAYLOAD_HARDLINK_INVALID");
+        await assertRealPathInsideRoot(rootRealPath, absolutePath);
+        const contents = await readExactRegularFile(absolutePath, identity);
+        const finalIdentity = await lstat(absolutePath);
+        assertUnchangedIdentity(identity, finalIdentity, "file");
+        entries.push({
+          path: relativePath,
+          type: "file",
+          size: contents.byteLength,
+          mode,
+          sha256: sha256(contents),
+        });
+      } else if (identity.isSymbolicLink()) {
+        const target = await readlink(absolutePath);
+        assertSymlinkTargetInsideRoot(payloadRoot, absolutePath, target);
+        const finalIdentity = await lstat(absolutePath);
+        assertUnchangedIdentity(identity, finalIdentity, "symlink");
+        entries.push({
+          path: relativePath,
+          type: "symlink",
+          size: Buffer.byteLength(target, "utf8"),
+          mode,
+          target,
+        });
+      } else {
+        throw new Error("RELEASE_PAYLOAD_SPECIAL_FILE");
+      }
+    }
+  }
+
+  await visit(payloadRoot, "");
+  entries.sort((left, right) => compareUtf8(left.path, right.path));
+  assertSymlinkTargetsExist(payloadRoot, entries);
+  return entries;
+}
+
+async function assertPayloadRoot(payloadRoot) {
+  let identity;
+  try {
+    identity = await lstat(payloadRoot);
+  } catch (error) {
+    throw new Error("RELEASE_PAYLOAD_ROOT_INVALID", { cause: error });
+  }
+  if (!identity.isDirectory() || identity.isSymbolicLink()) {
+    throw new Error("RELEASE_PAYLOAD_ROOT_INVALID");
+  }
+  return identity;
+}
+
+function assertPayloadEntryMode(entry) {
+  if (entry.type === "directory") {
+    if (entry.mode !== 0o555) throw new Error("RELEASE_PAYLOAD_MODE_POLICY_INVALID");
+    return;
+  }
+  if (entry.type === "file" && entry.mode !== 0o444 && entry.mode !== 0o555) {
+    throw new Error("RELEASE_PAYLOAD_MODE_POLICY_INVALID");
+  }
+}
+
+function assertUnchangedIdentity(before, after, expectedType) {
+  const typeMatches = expectedType === "directory"
+    ? after.isDirectory() && !after.isSymbolicLink()
+    : expectedType === "file"
+      ? after.isFile() && !after.isSymbolicLink()
+      : after.isSymbolicLink();
+  if (
+    !typeMatches
+    || before.dev !== after.dev
+    || before.ino !== after.ino
+    || before.mode !== after.mode
+    || before.size !== after.size
+    || before.nlink !== after.nlink
+  ) {
+    throw new Error("RELEASE_PAYLOAD_ENTRY_INVALID");
+  }
+}
+
+async function assertRealPathInsideRoot(rootRealPath, candidate) {
+  const candidateRealPath = await realpath(candidate);
+  const relative = path.relative(rootRealPath, candidateRealPath);
+  if (relative === "" || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("RELEASE_PAYLOAD_REALPATH_OUTSIDE_ROOT");
+  }
+}
+
+function assertSymlinkTargetInsideRoot(payloadRoot, linkPath, target) {
+  if (target.includes("\0") || path.isAbsolute(target)) {
+    throw new Error("RELEASE_PAYLOAD_SYMLINK_OUTSIDE_ROOT");
+  }
+  const resolvedTarget = path.resolve(path.dirname(linkPath), target);
+  const relative = path.relative(payloadRoot, resolvedTarget);
+  if (relative === "" || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("RELEASE_PAYLOAD_SYMLINK_OUTSIDE_ROOT");
+  }
+}
+
+function assertSymlinkTargetsExist(payloadRoot, entries) {
+  const entriesByPath = new Map(entries.map((entry) => [entry.path, entry]));
+  for (const entry of entries) {
+    if (entry.type !== "symlink") continue;
+    const visited = new Set([entry.path]);
+    let current = entry;
+    while (current.type === "symlink") {
+      const linkPath = path.join(payloadRoot, ...current.path.split("/"));
+      const resolvedTarget = path.resolve(path.dirname(linkPath), current.target);
+      const targetPath = path.relative(payloadRoot, resolvedTarget).split(path.sep).join("/");
+      const target = entriesByPath.get(targetPath);
+      if (target === undefined) {
+        throw new Error("RELEASE_PAYLOAD_SYMLINK_TARGET_INVALID");
+      }
+      if (visited.has(targetPath)) {
+        throw new Error("RELEASE_PAYLOAD_SYMLINK_CYCLE");
+      }
+      visited.add(targetPath);
+      current = target;
+    }
+  }
+}
+
+async function readExactRegularFile(filePath, expectedIdentity) {
+  let handle;
+  try {
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const openedIdentity = await handle.stat();
+    if (
+      !openedIdentity.isFile()
+      || openedIdentity.dev !== expectedIdentity.dev
+      || openedIdentity.ino !== expectedIdentity.ino
+    ) {
+      throw new Error("RELEASE_PAYLOAD_ENTRY_INVALID");
+    }
+    return await handle.readFile();
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function readMetadataFile(filePath) {
+  let identity;
+  try {
+    identity = await lstat(filePath);
+  } catch (error) {
+    throw new Error("RELEASE_MANIFEST_INVALID", { cause: error });
+  }
+  if (!identity.isFile() || identity.isSymbolicLink()) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+  if (identity.nlink !== 1) throw new Error("RELEASE_MANIFEST_INVALID");
+  if ((identity.mode & 0o777) !== 0o444) {
+    throw new Error("RELEASE_MANIFEST_METADATA_MODE_INVALID");
+  }
+  try {
+    const contents = await readExactRegularFile(filePath, identity);
+    const finalIdentity = await lstat(filePath);
+    assertUnchangedIdentity(identity, finalIdentity, "file");
+    return contents;
+  } catch (error) {
+    throw new Error("RELEASE_MANIFEST_INVALID", { cause: error });
+  }
+}
+
+async function atomicWrite(payloadRoot, filename, contents) {
+  const temporaryPath = path.join(
+    payloadRoot,
+    `.${filename}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(contents);
+    await handle.chmod(0o444);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, path.join(payloadRoot, filename));
+    await syncDirectory(payloadRoot);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+function assertManifest(value) {
+  assertPlainObject(value, "RELEASE_MANIFEST_INVALID");
+  assertExactKeys(value, ["entries", "manifestVersion", "provenance"]);
+  if (value.manifestVersion !== PAYLOAD_MANIFEST_VERSION || !Array.isArray(value.entries)) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+  assertPlainObject(value.provenance, "RELEASE_MANIFEST_INVALID");
+  normalizeJsonValue(value.provenance);
+
+  const seen = new Set();
+  let previousPath = null;
+  for (const entry of value.entries) {
+    assertManifestEntry(entry);
+    const folded = entry.path.toLowerCase();
+    if (seen.has(folded) || (previousPath !== null && compareUtf8(previousPath, entry.path) >= 0)) {
+      throw new Error("RELEASE_MANIFEST_INVALID");
+    }
+    seen.add(folded);
+    previousPath = entry.path;
+  }
+}
+
+function assertManifestEntry(entry) {
+  assertPlainObject(entry, "RELEASE_MANIFEST_INVALID");
+  validateRelativePayloadPath(entry.path);
+  if (!Number.isInteger(entry.size) || entry.size < 0 || !isMode(entry.mode)) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+  switch (entry.type) {
+    case "file":
+      assertExactKeys(entry, ["mode", "path", "sha256", "size", "type"]);
+      if (!sha256Pattern.test(entry.sha256)) throw new Error("RELEASE_MANIFEST_INVALID");
+      break;
+    case "directory":
+      assertExactKeys(entry, ["mode", "path", "size", "type"]);
+      if (entry.size !== 0) throw new Error("RELEASE_MANIFEST_INVALID");
+      break;
+    case "symlink":
+      assertExactKeys(entry, ["mode", "path", "size", "target", "type"]);
+      if (typeof entry.target !== "string") throw new Error("RELEASE_MANIFEST_INVALID");
+      break;
+    default:
+      throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+}
+
+function assertExactKeys(value, expected) {
+  const actual = Object.keys(value).sort(compareUtf8);
+  const sortedExpected = [...expected].sort(compareUtf8);
+  if (
+    actual.length !== sortedExpected.length
+    || actual.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new Error("RELEASE_MANIFEST_INVALID");
+  }
+}
+
+function assertPlainObject(value, code) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(code);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error(code);
+}
+
+function normalizeJsonValue(value, seen = new Set()) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("RELEASE_MANIFEST_INVALID");
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new Error("RELEASE_MANIFEST_INVALID");
+    seen.add(value);
+    const result = value.map((item) => normalizeJsonValue(item, seen));
+    seen.delete(value);
+    return result;
+  }
+  assertPlainObject(value, "RELEASE_MANIFEST_INVALID");
+  if (seen.has(value)) throw new Error("RELEASE_MANIFEST_INVALID");
+  seen.add(value);
+  const result = {};
+  for (const key of Object.keys(value).sort(compareUtf8)) {
+    const item = value[key];
+    if (item === undefined || typeof item === "function" || typeof item === "symbol" || typeof item === "bigint") {
+      throw new Error("RELEASE_MANIFEST_INVALID");
+    }
+    result[key] = normalizeJsonValue(item, seen);
+  }
+  seen.delete(value);
+  return result;
+}
+
+function sameEntry(left, right) {
+  return JSON.stringify(normalizeJsonValue(left)) === JSON.stringify(normalizeJsonValue(right));
+}
+
+function isMode(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 0o777;
+}
+
+function pathsOverlap(left, right) {
+  return left === right || isPathDescendant(left, right) || isPathDescendant(right, left);
+}
+
+function isPathDescendant(candidate, parent) {
+  const relative = path.relative(parent, candidate);
+  return relative.length > 0
+    && relative !== ".."
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
+
+async function resolveProspectiveRealPath(candidate) {
+  let existingAncestor = candidate;
+  const missingSegments = [];
+  while (true) {
+    try {
+      await lstat(existingAncestor);
+      break;
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        throw new Error("RELEASE_SMOKE_PATH_INVALID", { cause: error });
+      }
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        throw new Error("RELEASE_SMOKE_PATH_INVALID", { cause: error });
+      }
+      missingSegments.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+  let resolvedAncestor;
+  try {
+    resolvedAncestor = await realpath(existingAncestor);
+  } catch (error) {
+    throw new Error("RELEASE_SMOKE_PATH_INVALID", { cause: error });
+  }
+  return path.resolve(resolvedAncestor, ...missingSegments);
+}
+
+async function syncDirectory(directory) {
+  const handle = await open(directory, constants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function sha256(contents) {
+  return createHash("sha256").update(contents).digest("hex");
+}

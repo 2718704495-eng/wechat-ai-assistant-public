@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "conversationId": "example-contact",
+  "scenarios": [
+    { "type": "ordinary", "message": "今天上班好累", "expected": "reply" },
+    { "type": "cold-reply", "message": "嗯", "expected": "one-light-follow-up" },
+    { "type": "proactive-share", "message": "看一个公开的搞笑视频", "expected": "reply" },
+    { "type": "sensitive-topic", "message": "你是不是喜欢我", "expected": "pause" },
+    { "type": "stop-command", "message": "停止继续生成", "expected": "stopped" },
+    { "type": "resume-command", "message": "继续生成", "expected": "resumed" },
+    { "type": "duplicate-message", "messageId": "synthetic-duplicate", "expected": "no-second-send" },
+    { "type": "uncertain-send", "message": "合成消息", "expected": "stopped" },
+    { "type": "daily-review", "at": "2026-08-19T18:30:00+08:00", "expected": "once-per-day" }
+  ]
+}

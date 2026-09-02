@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+release_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+exec /Users/example/.nvm/versions/node/v20.20.2/bin/node \
+  "$release_root/dist/src/mcp/daily-care-supervisor-main.js"

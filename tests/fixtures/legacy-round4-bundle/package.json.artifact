@@ -1,0 +1,33 @@
+{
+  "name": "wechat-ai-assistant-public",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.20.0 <21"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "live:bridge": "node dist/src/mcp/live-cli-bridge-main.js",
+    "mcp:current": "node dist/src/mcp/current-server-main.js",
+    "mcp:current:read": "node dist/src/mcp/current-client-main.js",
+    "mcp:history": "node dist/src/mcp/history-server-main.js",
+    "mcp:live": "node dist/src/mcp/live-server-main.js",
+    "native:test": "swift test --package-path native/WechatVisionBridge",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/node": "20.19.43",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.11"
+  }
+}

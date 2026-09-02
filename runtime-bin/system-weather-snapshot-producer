@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'SYSTEM_WEATHER_SNAPSHOT_FAILED' >&2
+  exit 1
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+release_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+exec /Users/example/.nvm/versions/node/v20.20.2/bin/node \
+  "$release_root/dist/src/mcp/system-weather-snapshot-main.js"

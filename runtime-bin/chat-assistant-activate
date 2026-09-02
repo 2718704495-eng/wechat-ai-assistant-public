@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ] || [ "$1" != "--stage" ]; then
+  printf '%s\n' 'CHAT_ASSISTANT_ACTIVATION_FAILED' >&2
+  exit 1
+fi
+
+case "$2" in
+  prepare-report|approve-report|boundary|A|B0|B1|finalize|recover-image-quarantine|accept-card|inspect) ;;
+  *)
+    printf '%s\n' 'CHAT_ASSISTANT_ACTIVATION_FAILED' >&2
+    exit 1
+    ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+release_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+exec /Users/example/.nvm/versions/node/v20.20.2/bin/node \
+  "$release_root/dist/src/runtime-v2/runtime-activation-main.js" "$@"

@@ -1,0 +1,27 @@
+.DS_Store
+.agents/
+
+# Dependency and generated build outputs
+node_modules/
+dist/
+coverage/
+native/WechatVisionBridge/.build/
+native/kernel-lock/build/
+
+# Local logs and runtime state
+*.log
+npm-debug.log*
+state/
+vault/
+logs/
+profiles/
+
+# Secrets and machine-local environment
+.env
+.env.*
+!.env.example
+
+# Machine-local overrides should use untracked local suffixes.
+config/*.local.toml
+config/*.local.plist
+config/local.*.plist

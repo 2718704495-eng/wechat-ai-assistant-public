@@ -1,0 +1,2997 @@
+import { Buffer } from "node:buffer";
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readlink,
+  realpath,
+  rename,
+  stat,
+  symlink,
+  unlink,
+} from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { promisify } from "node:util";
+
+const maximumMaintenanceMetadataBytes = 2_048;
+const maximumTransactionJournalBytes = 32_768;
+const transactionDecisionMaximumAgeMs = 60_000;
+const transactionJournalFilename = "release-transaction.json";
+const installerLockFilename = "release-install.lock";
+const transactionArchiveDirectoryName = "release-transaction-archive";
+const maintenanceArchiveDirectoryName = "release-maintenance-archive";
+const installerArchiveDirectoryName = "release-installer-archive";
+const manifestSha256Pattern = /^[a-f0-9]{64}$/u;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const processStartedAt = new Date(Date.now() - process.uptime() * 1_000).toISOString();
+const consumedTransactionDecisions = new Set();
+const execFileAsync = promisify(execFile);
+
+export function createCommitDecisionGate(options) {
+  assertCommitGateOptions(options);
+  let accepted = false;
+
+  return {
+    accept(serialized) {
+      if (accepted) throw new Error("RELEASE_COMMIT_DECISION_REPLAYED");
+
+      const decision = parseCommitDecision(serialized);
+      const observedAt = Date.parse(decision.automationObservation.observedAt);
+      const requestedAt = Date.parse(options.requestedAt);
+      const now = options.now().getTime();
+      const matchesSession =
+        decision.txid === options.txid &&
+        decision.maintenanceNonce === options.maintenanceNonce &&
+        decision.automationObservation.requestId === options.automationRequestId;
+      const isFresh =
+        observedAt >= requestedAt &&
+        observedAt <= now &&
+        now - observedAt <= options.maximumAgeMs;
+
+      if (!matchesSession || !isFresh) {
+        throw new Error("RELEASE_COMMIT_DECISION_INVALID");
+      }
+
+      accepted = true;
+      return decision;
+    },
+  };
+}
+
+export async function acquireMaintenanceLease(options) {
+  const staged = await stageMaintenanceLease(options);
+  try {
+    return await staged.publish();
+  } catch (error) {
+    await staged.discard();
+    throw error;
+  }
+}
+
+async function stageMaintenanceLease(options) {
+  assertUuid(options?.txid);
+  assertUuid(options?.maintenanceNonce);
+  if (typeof options?.runtimeRoot !== "string" || options.runtimeRoot.length === 0) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_INVALID");
+  }
+
+  const stateDirectory = path.join(path.resolve(options.runtimeRoot), "state");
+  const lockPath = path.join(stateDirectory, "live-operation.lock");
+  const stagedPath = path.join(
+    stateDirectory,
+    `.live-operation.lock.${options.txid}.${options.maintenanceNonce}.staged`,
+  );
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+
+  let handle;
+  try {
+    handle = await open(stagedPath, "wx", 0o600);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+    }
+    throw error;
+  }
+
+  const metadata = {
+    version: 1,
+    purpose: "release-maintenance",
+    txid: options.txid,
+    maintenanceNonce: options.maintenanceNonce,
+    pid: process.pid,
+    processStartedAt,
+    acquiredAt: new Date().toISOString(),
+  };
+
+  try {
+    await handle.writeFile(JSON.stringify(metadata), "utf8");
+    await handle.sync();
+    const identity = await handle.stat();
+    await syncDirectory(stateDirectory);
+    return new StagedMaintenanceLease({
+      stagedPath,
+      lockPath,
+      stateDirectory,
+      handle,
+      device: identity.dev,
+      inode: identity.ino,
+      metadata,
+    });
+  } catch (error) {
+    await removeCreatedMarker(stagedPath, stateDirectory, handle);
+    throw error;
+  }
+}
+
+async function acquireInstallerLease(options) {
+  assertUuid(options?.txid);
+  if (typeof options?.runtimeRoot !== "string" || options.runtimeRoot.length === 0) {
+    throw new Error("RELEASE_INSTALLER_LEASE_INVALID");
+  }
+  const stateDirectory = path.join(path.resolve(options.runtimeRoot), "state");
+  const lockPath = path.join(stateDirectory, installerLockFilename);
+  const operation = options.operation;
+  const installerNonce = options.installerNonce ?? randomUUID();
+  const previousInstallerNonce = options.previousInstallerNonce ?? null;
+  const transactionJournalSha256 = options.transactionJournalSha256 ?? null;
+  if (!["install", "rollback"].includes(operation)) {
+    throw new Error("RELEASE_INSTALLER_LEASE_INVALID");
+  }
+  assertUuid(installerNonce);
+  if (previousInstallerNonce !== null) assertUuid(previousInstallerNonce);
+  if (
+    transactionJournalSha256 !== null
+    && !manifestSha256Pattern.test(transactionJournalSha256)
+  ) {
+    throw new Error("RELEASE_INSTALLER_LEASE_INVALID");
+  }
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+
+  let handle;
+  try {
+    handle = await open(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new Error("RELEASE_INSTALLER_BUSY", { cause: error });
+    }
+    throw error;
+  }
+  const metadata = {
+    version: 1,
+    purpose: "release-installer",
+    operation,
+    txid: options.txid,
+    installerNonce,
+    previousInstallerNonce,
+    transactionJournalSha256,
+    pid: process.pid,
+    processStartedAt,
+    acquiredAt: new Date().toISOString(),
+  };
+  try {
+    await handle.writeFile(JSON.stringify(metadata), "utf8");
+    await handle.sync();
+    const identity = await handle.stat();
+    await syncDirectory(stateDirectory);
+    return new PersistentInstallerLease({
+      lockPath,
+      stateDirectory,
+      handle,
+      device: identity.dev,
+      inode: identity.ino,
+      metadata,
+    });
+  } catch (error) {
+    await removeCreatedMarker(lockPath, stateDirectory, handle);
+    throw error;
+  }
+}
+
+export async function resolveValidatedPreviousRelease(options) {
+  try {
+    if (
+      typeof options?.runtimeRoot !== "string" ||
+      options.runtimeRoot.length === 0 ||
+      typeof options.validateRelease !== "function"
+    ) {
+      throw new Error("INVALID_ROLLBACK_OPTIONS");
+    }
+
+    const runtimeRoot = await realpath(path.resolve(options.runtimeRoot));
+    const releaseStore = path.join(runtimeRoot, ".releases");
+    const storeIdentity = await lstat(releaseStore);
+    if (!storeIdentity.isDirectory() || storeIdentity.isSymbolicLink()) {
+      throw new Error("INVALID_RELEASE_STORE");
+    }
+    const realReleaseStore = await realpath(releaseStore);
+
+    const previousPointer = path.join(runtimeRoot, "bin.previous");
+    const pointerIdentity = await lstat(previousPointer);
+    if (!pointerIdentity.isSymbolicLink()) {
+      throw new Error("INVALID_PREVIOUS_POINTER");
+    }
+
+    const pointerTarget = await readlink(previousPointer);
+    if (pointerTarget.length === 0 || path.isAbsolute(pointerTarget) || pointerTarget.includes("\0")) {
+      throw new Error("INVALID_PREVIOUS_TARGET");
+    }
+    const lexicalTarget = path.resolve(path.dirname(previousPointer), pointerTarget);
+    if (!isStrictDescendant(realReleaseStore, lexicalTarget)) {
+      throw new Error("PREVIOUS_TARGET_OUTSIDE_RELEASE_STORE");
+    }
+
+    const targetIdentity = await lstat(lexicalTarget);
+    if (!targetIdentity.isDirectory() || targetIdentity.isSymbolicLink()) {
+      throw new Error("INVALID_PREVIOUS_RELEASE_ROOT");
+    }
+    const releaseRoot = await realpath(lexicalTarget);
+    if (!isStrictDescendant(realReleaseStore, releaseRoot)) {
+      throw new Error("PREVIOUS_REALPATH_OUTSIDE_RELEASE_STORE");
+    }
+
+    await options.validateRelease(releaseRoot);
+    return releaseRoot;
+  } catch (error) {
+    throw new Error("NO_VALIDATED_PREVIOUS_RELEASE", { cause: error });
+  }
+}
+
+export async function installValidatedCandidate(options) {
+  const context = prepareTransactionContext(options, true);
+  const candidateRoot = await assertControlledStagingCandidate(
+    context.runtimeRoot,
+    path.resolve(options.candidateRoot),
+  );
+  const candidateIdentity = await immutableDirectoryIdentity(candidateRoot);
+  const candidateManifestSha256 = manifestSha256FromValidation(
+    await options.validateRelease(candidateRoot),
+  );
+  await assertDirectoryIdentity(candidateRoot, candidateIdentity, true);
+  const installerLease = await acquireInstallerLease({
+    runtimeRoot: context.runtimeRoot,
+    txid: context.session.txid,
+    operation: "install",
+  });
+  let lease;
+  let stagedLease;
+  try {
+    await assertTransactionDecisionNotArchived(
+      context.runtimeRoot,
+      context.session.txid,
+    );
+    assertTransactionDecisionNotConsumed(context);
+    const precheckDecision = acceptTransactionDecision(
+      await readTransactionDecision(context, "precheck"),
+      "precheck",
+      context.session.precheckRequestId,
+      context.session.precheckObservationId,
+      context.session.precheckRequestedAt,
+      context,
+    );
+
+    stagedLease = await stageMaintenanceLease({
+      runtimeRoot: context.runtimeRoot,
+      txid: context.session.txid,
+      maintenanceNonce: context.session.maintenanceNonce,
+    });
+    const releaseName = `${candidateManifestSha256.slice(0, 16)}-${context.session.txid}`;
+    const plannedCandidate = validatedState(
+      path.posix.join(".releases", releaseName),
+      candidateManifestSha256,
+    );
+    const stagedJournal = createMaintenanceStagedJournalRecord({
+      context,
+      operation: "install",
+      candidate: plannedCandidate,
+      candidateStagingTarget: path.posix.join(
+        ".releases",
+        path.basename(candidateRoot),
+      ),
+      candidateStagingIdentity: candidateIdentity,
+      installerLease,
+      maintenanceLease: stagedLease,
+      precheckDecision,
+    });
+    await createTransactionJournal(context.runtimeRoot, stagedJournal);
+    await options.hook?.("maintenance-staged");
+    lease = await stagedLease.publish();
+    stagedLease = undefined;
+
+    const runtimeRoot = await realpath(context.runtimeRoot);
+    const releaseStore = path.join(runtimeRoot, ".releases");
+    await assertSameFileSystem(candidateRoot, releaseStore);
+    const releaseRoot = path.join(releaseStore, releaseName);
+    await assertPathAbsent(releaseRoot, "RELEASE_DESTINATION_EXISTS");
+    const current = await inspectCurrentState(runtimeRoot, options.validateRelease);
+    const previous = await inspectPreviousState(runtimeRoot, options.validateRelease);
+    const candidate = validatedState(
+      plannedCandidate.target,
+      candidateManifestSha256,
+      releaseRoot,
+    );
+    const legacyTarget = current.kind === "legacy"
+      ? path.posix.join(".releases", `legacy-${context.session.txid}`)
+      : null;
+    const desiredPrevious = current.kind === "validated"
+      ? current
+      : absentState();
+    const journal = createTransactionJournalRecord({
+      context,
+      operation: "install",
+      candidate,
+      candidateStagingTarget: stagedJournal.candidateStagingTarget,
+      candidateStagingIdentity: stagedJournal.candidateStagingIdentity,
+      beforeCurrent: current,
+      beforePrevious: previous,
+      desiredCurrent: candidate,
+      desiredPrevious,
+      legacyTarget,
+      installerLease,
+      maintenanceLease: lease,
+      precheckDecision,
+      commitDecision: null,
+    });
+    journal.phase = "awaiting-commit";
+    await updateTransactionJournal(runtimeRoot, journal);
+
+    prepareCommitDecisionRequest(context);
+    const commitDecision = acceptTransactionDecision(
+      await readTransactionDecision(context, "commit"),
+      "commit",
+      context.session.commitRequestId,
+      context.session.commitObservationId,
+      context.session.commitRequestedAt,
+      context,
+    );
+    journal.automationObservations.commit = {
+      ...commitDecision.automationObservation,
+    };
+    await updateTransactionJournal(runtimeRoot, journal);
+    markTransactionDecisionConsumed(context);
+
+    if (
+      current.kind === "validated" &&
+      current.manifestSha256 === candidateManifestSha256
+    ) {
+      journal.desired.current = serializablePointerState(current);
+      journal.desired.previous = serializablePointerState(previous);
+      journal.phase = "current-switched";
+      await updateTransactionJournal(runtimeRoot, journal);
+      await archiveTransactionJournal(runtimeRoot, journal);
+      return { installed: false, idempotent: true, releaseRoot: current.releaseRoot };
+    }
+    journal.phase = "candidate-moving";
+    await updateTransactionJournal(runtimeRoot, journal);
+    await moveImmutableCandidate(candidateRoot, releaseRoot, options.hook);
+    const movedManifestSha256 = manifestSha256FromValidation(
+      await options.validateRelease(releaseRoot),
+    );
+    if (movedManifestSha256 !== candidateManifestSha256) {
+      throw new Error("RELEASE_CANDIDATE_CHANGED_DURING_MOVE");
+    }
+    journal.phase = "prepared";
+    await updateTransactionJournal(runtimeRoot, journal);
+
+    if (current.kind === "legacy") {
+      journal.phase = "legacy-migrating";
+      await updateTransactionJournal(runtimeRoot, journal);
+      await migrateLegacyCurrent(runtimeRoot, legacyTarget);
+      journal.phase = "legacy-migrated";
+      await updateTransactionJournal(runtimeRoot, journal);
+    }
+
+    journal.phase = "previous-prepared";
+    await updateTransactionJournal(runtimeRoot, journal);
+    await applyPointerState(
+      runtimeRoot,
+      "bin.previous",
+      desiredPrevious,
+      options.validateRelease,
+    );
+    await options.hook?.("previous-prepared");
+
+    journal.phase = "current-switched";
+    await updateTransactionJournal(runtimeRoot, journal);
+    await applyPointerState(runtimeRoot, "bin", candidate, options.validateRelease);
+    await options.hook?.("current-switched");
+
+    await assertPointerMatches(runtimeRoot, "bin", candidate, options.validateRelease);
+    await assertPointerMatches(
+      runtimeRoot,
+      "bin.previous",
+      desiredPrevious,
+      options.validateRelease,
+    );
+    await archiveTransactionJournal(runtimeRoot, journal);
+    await options.hook?.("journal-archived", transactionHookContext(context, lease));
+    return { installed: true, idempotent: false, releaseRoot };
+  } finally {
+    await stagedLease?.discard();
+    await installerLease.release();
+    await lease?.release();
+  }
+}
+
+export async function rollbackValidatedRelease(options) {
+  const context = prepareTransactionContext(options, false);
+  const installerLease = await acquireInstallerLease({
+    runtimeRoot: context.runtimeRoot,
+    txid: context.session.txid,
+    operation: "rollback",
+  });
+  let lease;
+  let stagedLease;
+  try {
+    await assertTransactionDecisionNotArchived(
+      context.runtimeRoot,
+      context.session.txid,
+    );
+    assertTransactionDecisionNotConsumed(context);
+    const precheckDecision = acceptTransactionDecision(
+      await readTransactionDecision(context, "precheck"),
+      "precheck",
+      context.session.precheckRequestId,
+      context.session.precheckObservationId,
+      context.session.precheckRequestedAt,
+      context,
+    );
+
+    stagedLease = await stageMaintenanceLease({
+      runtimeRoot: context.runtimeRoot,
+      txid: context.session.txid,
+      maintenanceNonce: context.session.maintenanceNonce,
+    });
+    const stagedJournal = createMaintenanceStagedJournalRecord({
+      context,
+      operation: "rollback",
+      candidate: null,
+      candidateStagingTarget: null,
+      candidateStagingIdentity: null,
+      installerLease,
+      maintenanceLease: stagedLease,
+      precheckDecision,
+    });
+    await createTransactionJournal(context.runtimeRoot, stagedJournal);
+    await options.hook?.("maintenance-staged");
+    lease = await stagedLease.publish();
+    stagedLease = undefined;
+    const runtimeRoot = await realpath(context.runtimeRoot);
+    const current = await inspectCurrentState(runtimeRoot, options.validateRelease);
+    const previous = await inspectPreviousState(runtimeRoot, options.validateRelease);
+    if (current.kind !== "validated" || previous.kind !== "validated") {
+      throw new Error("NO_VALIDATED_PREVIOUS_RELEASE");
+    }
+    const journal = createTransactionJournalRecord({
+      context,
+      operation: "rollback",
+      candidate: null,
+      beforeCurrent: current,
+      beforePrevious: previous,
+      desiredCurrent: previous,
+      desiredPrevious: current,
+      legacyTarget: null,
+      installerLease,
+      maintenanceLease: lease,
+      precheckDecision,
+      commitDecision: null,
+    });
+    journal.phase = "awaiting-commit";
+    await updateTransactionJournal(runtimeRoot, journal);
+
+    prepareCommitDecisionRequest(context);
+    const commitDecision = acceptTransactionDecision(
+      await readTransactionDecision(context, "commit"),
+      "commit",
+      context.session.commitRequestId,
+      context.session.commitObservationId,
+      context.session.commitRequestedAt,
+      context,
+    );
+    journal.automationObservations.commit = {
+      ...commitDecision.automationObservation,
+    };
+    await updateTransactionJournal(runtimeRoot, journal);
+    markTransactionDecisionConsumed(context);
+
+    journal.phase = "previous-prepared";
+    await updateTransactionJournal(runtimeRoot, journal);
+    await applyPointerState(
+      runtimeRoot,
+      "bin.previous",
+      current,
+      options.validateRelease,
+    );
+    await options.hook?.("previous-prepared");
+
+    journal.phase = "current-switched";
+    await updateTransactionJournal(runtimeRoot, journal);
+    await applyPointerState(runtimeRoot, "bin", previous, options.validateRelease);
+    await options.hook?.("current-switched");
+
+    await assertPointerMatches(runtimeRoot, "bin", previous, options.validateRelease);
+    await assertPointerMatches(
+      runtimeRoot,
+      "bin.previous",
+      current,
+      options.validateRelease,
+    );
+    await archiveTransactionJournal(runtimeRoot, journal);
+    await options.hook?.("journal-archived", transactionHookContext(context, lease));
+    return { rolledBack: true, currentReleaseRoot: previous.releaseRoot };
+  } finally {
+    await stagedLease?.discard();
+    await installerLease.release();
+    await lease?.release();
+  }
+}
+
+export async function recoverReleaseTransaction(options) {
+  if (
+    typeof options?.runtimeRoot !== "string" ||
+    options.runtimeRoot.length === 0 ||
+    typeof options.now !== "function" ||
+    typeof options.validateRelease !== "function" ||
+    typeof options.readDecision !== "function"
+  ) {
+    throw new Error("RELEASE_TRANSACTION_INVALID");
+  }
+  const observedNow = options.now();
+  if (!(observedNow instanceof Date) || !Number.isFinite(observedNow.getTime())) {
+    throw new Error("RELEASE_TRANSACTION_INVALID");
+  }
+
+  const runtimeRoot = path.resolve(options.runtimeRoot);
+  const recoverable = await readRecoverableTransaction(runtimeRoot);
+  const { initialBytes, journal } = recoverable;
+  const context = prepareRecoveryTransactionContext(options, journal);
+  const precheckDecision = acceptTransactionDecision(
+    await readTransactionDecision(context, "precheck"),
+    "precheck",
+    context.session.precheckRequestId,
+    context.session.precheckObservationId,
+    context.session.precheckRequestedAt,
+    context,
+  );
+  const admitted = await acquireRecoveryLeases({
+    ...options,
+    runtimeRoot,
+    journal,
+    archived: recoverable.archived,
+    installerSnapshotArchived: recoverable.installerSnapshotArchived,
+    installerSnapshot: recoverable.installerSnapshot,
+    transactionJournalBytes: initialBytes,
+    transactionJournalSha256: sha256Text(initialBytes),
+  });
+  let retainMaintenance = false;
+  try {
+    prepareCommitDecisionRequest(context);
+    const commitDecision = acceptTransactionDecision(
+      await readTransactionDecision(context, "commit"),
+      "commit",
+      context.session.commitRequestId,
+      context.session.commitObservationId,
+      context.session.commitRequestedAt,
+      context,
+    );
+    const verifiedBytes = recoverable.archived
+      ? await readArchivedTransactionJournal(recoverable.archivePath)
+      : await readTransactionJournal(runtimeRoot);
+    if (verifiedBytes !== initialBytes) {
+      throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+    }
+    retainMaintenance = true;
+    if (!recoverable.archived) {
+      if (journal.phase === "maintenance-staged") {
+        const [current, previous] = await Promise.all([
+          inspectCurrentState(runtimeRoot, options.validateRelease),
+          inspectPreviousState(runtimeRoot, options.validateRelease),
+        ]);
+        journal.before = {
+          current: serializablePointerState(current),
+          previous: serializablePointerState(previous),
+        };
+        journal.desired = {
+          current: serializablePointerState(current),
+          previous: serializablePointerState(previous),
+        };
+        journal.phase = "current-switched";
+        journal.maintenanceLease = maintenanceLeaseJournalIdentity(
+          admitted.maintenanceLease,
+        );
+        journal.installerClaim = installerLeaseJournalIdentity(
+          admitted.installerLease,
+        );
+        journal.recoveryAutomationObservations = {
+          precheck: { ...precheckDecision.automationObservation },
+          commit: { ...commitDecision.automationObservation },
+        };
+        await updateTransactionJournal(runtimeRoot, journal);
+      }
+      if (journal.phase === "candidate-moving") {
+        await stabilizeCandidateMoveState(
+          runtimeRoot,
+          journal,
+          options.validateRelease,
+        );
+      }
+      await assertPointerPhaseLegal(
+        runtimeRoot,
+        journal,
+        options.validateRelease,
+      );
+    }
+    if (!recoverable.archived) {
+      journal.maintenanceLease = maintenanceLeaseJournalIdentity(admitted.maintenanceLease);
+      journal.installerClaim = installerLeaseJournalIdentity(admitted.installerLease);
+      journal.recoveryAutomationObservations = {
+        precheck: { ...precheckDecision.automationObservation },
+        commit: { ...commitDecision.automationObservation },
+      };
+      await updateTransactionJournal(runtimeRoot, journal);
+    }
+    if (admitted.forensic) {
+      await options.hook?.("forensic-admitted", {
+        txid: journal.txid,
+        maintenanceNonce: journal.maintenanceNonce,
+      });
+    }
+
+    if (recoverable.archived) {
+      await assertPointerMatches(
+        runtimeRoot,
+        "bin.previous",
+        journal.desired.previous,
+        options.validateRelease,
+      );
+      await assertPointerMatches(
+        runtimeRoot,
+        "bin",
+        journal.desired.current,
+        options.validateRelease,
+      );
+    } else if (journal.phase === "current-switched") {
+      await applyPointerState(
+        runtimeRoot,
+        "bin.previous",
+        journal.desired.previous,
+        options.validateRelease,
+      );
+      await applyPointerState(
+        runtimeRoot,
+        "bin",
+        journal.desired.current,
+        options.validateRelease,
+      );
+      await assertPointerMatches(
+        runtimeRoot,
+        "bin.previous",
+        journal.desired.previous,
+        options.validateRelease,
+      );
+      await assertPointerMatches(
+        runtimeRoot,
+        "bin",
+        journal.desired.current,
+        options.validateRelease,
+      );
+    } else if (
+      journal.phase === "awaiting-commit" ||
+      journal.phase === "candidate-moving" ||
+      journal.phase === "prepared" ||
+      journal.phase === "legacy-migrating" ||
+      journal.phase === "legacy-migrated" ||
+      journal.phase === "previous-prepared"
+    ) {
+      await restoreCurrentState(
+        runtimeRoot,
+        journal.before.current,
+        journal.legacyTarget,
+        options.validateRelease,
+      );
+      await applyPointerState(
+        runtimeRoot,
+        "bin.previous",
+        journal.before.previous,
+        options.validateRelease,
+      );
+      await assertPointerMatches(
+        runtimeRoot,
+        "bin.previous",
+        journal.before.previous,
+        options.validateRelease,
+      );
+    } else {
+      throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+    }
+
+    if (!recoverable.archived) {
+      await archiveTransactionJournal(runtimeRoot, journal);
+      await options.hook?.("journal-archived", {
+        txid: journal.txid,
+        maintenanceNonce: journal.maintenanceNonce,
+      });
+    }
+    retainMaintenance = false;
+    return { recovered: true, phase: journal.phase };
+  } finally {
+    await admitted.installerLease.release();
+    if (retainMaintenance) {
+      await admitted.maintenanceLease.retain();
+    } else {
+      await admitted.maintenanceLease.release();
+    }
+  }
+}
+
+async function assertPointerPhaseLegal(runtimeRoot, journal, validateRelease) {
+  if (journal.phase === "maintenance-staged" || journal.before === null || journal.desired === null) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  const [current, previous] = await Promise.all([
+    inspectCurrentState(runtimeRoot, validateRelease),
+    inspectPreviousState(runtimeRoot, validateRelease),
+  ]);
+  const observedCurrent = serializablePointerState(current);
+  const observedPrevious = serializablePointerState(previous);
+  const currentBefore = journal.before.current.kind === "legacy"
+    && ["legacy-migrating", "legacy-migrated", "previous-prepared"].includes(journal.phase)
+    ? absentState()
+    : journal.before.current;
+  const legal = (() => {
+    if (["awaiting-commit", "candidate-moving", "prepared"].includes(journal.phase)) {
+      return samePointerState(observedCurrent, journal.before.current)
+        && samePointerState(observedPrevious, journal.before.previous);
+    }
+    if (journal.phase === "legacy-migrating") {
+      return (
+        samePointerState(observedCurrent, journal.before.current)
+        || samePointerState(observedCurrent, absentState())
+      ) && samePointerState(observedPrevious, journal.before.previous);
+    }
+    if (journal.phase === "legacy-migrated") {
+      return samePointerState(observedCurrent, absentState())
+        && samePointerState(observedPrevious, journal.before.previous);
+    }
+    if (journal.phase === "previous-prepared") {
+      return samePointerState(observedCurrent, currentBefore)
+        && (
+          samePointerState(observedPrevious, journal.before.previous)
+          || samePointerState(observedPrevious, journal.desired.previous)
+        );
+    }
+    if (journal.phase === "current-switched") {
+      return samePointerState(observedPrevious, journal.desired.previous)
+        && (
+          samePointerState(observedCurrent, currentBefore)
+          || samePointerState(observedCurrent, journal.desired.current)
+        );
+    }
+    return false;
+  })();
+  if (!legal) throw new Error("RELEASE_POINTER_STATE_AMBIGUOUS");
+}
+
+function samePointerState(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function acquireRecoveryLeases(options) {
+  const stateDirectory = path.join(options.runtimeRoot, "state");
+  const maintenancePath = path.join(stateDirectory, "live-operation.lock");
+  if (!(await pathExists(maintenancePath))) {
+    let installerLease;
+    let forensic = false;
+    if (options.installerSnapshot !== null) {
+      const snapshot = options.installerSnapshot;
+      if (
+        snapshot.metadata.txid !== options.journal.txid
+        || snapshot.metadata.operation !== options.journal.operation
+      ) {
+        throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+      }
+      const takeoverNonce = randomUUID();
+      await archiveInstallerJournalClaim({
+        runtimeRoot: options.runtimeRoot,
+        txid: options.journal.txid,
+        installerNonce: takeoverNonce,
+        serialized: options.transactionJournalBytes,
+      });
+      if (options.installerSnapshotArchived) {
+        installerLease = await acquireInstallerLease({
+          runtimeRoot: options.runtimeRoot,
+          txid: options.journal.txid,
+          operation: options.journal.operation,
+          installerNonce: takeoverNonce,
+          previousInstallerNonce: snapshot.metadata.installerNonce,
+          transactionJournalSha256: options.transactionJournalSha256,
+        });
+      } else {
+        await assertDeadOwner(
+          snapshot.metadata,
+          options.inspectOwnerIdentity,
+          "RELEASE_INSTALLER_BUSY",
+          "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+        );
+        installerLease = await replaceStaleMarker({
+          snapshot,
+          archiveDirectoryName: installerArchiveDirectoryName,
+          archiveFilename: `${options.journal.txid}-${snapshot.metadata.installerNonce}.json`,
+          metadata: {
+            ...snapshot.metadata,
+            installerNonce: takeoverNonce,
+            previousInstallerNonce: snapshot.metadata.installerNonce,
+            transactionJournalSha256: options.transactionJournalSha256,
+            pid: process.pid,
+            processStartedAt,
+            acquiredAt: new Date().toISOString(),
+          },
+          LeaseClass: PersistentInstallerLease,
+          parseMetadata: parseInstallerMetadata,
+          sameMetadata: sameInstallerMetadata,
+          ambiguousCode: "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+        });
+      }
+      forensic = true;
+    } else if (options.archived) {
+      installerLease = await acquireInstallerLease({
+        runtimeRoot: options.runtimeRoot,
+        txid: options.journal.txid,
+        operation: options.journal.operation,
+      });
+    } else {
+      throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+    }
+    try {
+      const maintenanceLease = options.archived
+        ? await acquireMaintenanceLease({
+          runtimeRoot: options.runtimeRoot,
+          txid: options.journal.txid,
+          maintenanceNonce: options.journal.maintenanceNonce,
+        })
+        : await replaceRecoverableStagedMaintenance({
+          runtimeRoot: options.runtimeRoot,
+          journal: options.journal,
+          installerMetadata: options.installerSnapshot.metadata,
+          allowMissingPriorMarker: options.installerSnapshotArchived,
+        });
+      return { installerLease, maintenanceLease, forensic };
+    } catch (error) {
+      await installerLease.release();
+      throw error;
+    }
+  }
+
+  const maintenanceSnapshot = await readMarkerSnapshot(
+    maintenancePath,
+    parseMaintenanceMetadata,
+    "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS",
+  );
+  assertMaintenanceSnapshotMatchesJournal(maintenanceSnapshot, options.journal);
+  await removeDuplicateStagedMaintenance(
+    options.runtimeRoot,
+    options.journal,
+    maintenanceSnapshot,
+  );
+  const inspectOwnerIdentity = options.inspectOwnerIdentity ?? inspectProcessOwnerIdentity;
+  let ownerIdentity;
+  try {
+    ownerIdentity = await inspectOwnerIdentity({
+      pid: maintenanceSnapshot.metadata.pid,
+      processStartedAt: maintenanceSnapshot.metadata.processStartedAt,
+    });
+  } catch (error) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+  }
+  if (ownerIdentity === "alive-exact") throw new Error("RELEASE_RUNTIME_BUSY");
+  if (ownerIdentity !== "dead") {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+
+  const installerPath = path.join(stateDirectory, installerLockFilename);
+  let installerLease;
+  if (await pathExists(installerPath)) {
+    const installerSnapshot = await readMarkerSnapshot(
+      installerPath,
+      parseInstallerMetadata,
+      "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+    );
+    if (
+      installerSnapshot.metadata.txid !== options.journal.txid ||
+      installerSnapshot.metadata.operation !== options.journal.operation ||
+      installerSnapshot.metadata.pid !== maintenanceSnapshot.metadata.pid ||
+      installerSnapshot.metadata.processStartedAt !==
+        maintenanceSnapshot.metadata.processStartedAt
+    ) {
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+    }
+    const takeoverNonce = randomUUID();
+    await archiveInstallerJournalClaim({
+      runtimeRoot: options.runtimeRoot,
+      txid: options.journal.txid,
+      installerNonce: takeoverNonce,
+      serialized: options.transactionJournalBytes,
+    });
+    installerLease = await replaceStaleMarker({
+      snapshot: installerSnapshot,
+      archiveDirectoryName: installerArchiveDirectoryName,
+      archiveFilename: `${options.journal.txid}-${installerSnapshot.metadata.installerNonce}.json`,
+      metadata: {
+        ...installerSnapshot.metadata,
+        installerNonce: takeoverNonce,
+        previousInstallerNonce: installerSnapshot.metadata.installerNonce,
+        transactionJournalSha256: options.transactionJournalSha256,
+        pid: process.pid,
+        processStartedAt,
+        acquiredAt: new Date().toISOString(),
+      },
+      LeaseClass: PersistentInstallerLease,
+      parseMetadata: parseInstallerMetadata,
+      sameMetadata: sameInstallerMetadata,
+      ambiguousCode: "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+    });
+  } else {
+    const archivedInstallerPath = path.join(
+      stateDirectory,
+      installerArchiveDirectoryName,
+      `${options.journal.txid}-${options.journal.installerClaim.nonce}.json`,
+    );
+    const archivedInstaller = await readMarkerSnapshot(
+      archivedInstallerPath,
+      parseInstallerMetadata,
+      "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+    );
+    assertInstallerSnapshotMatchesJournal(archivedInstaller, options.journal);
+    await assertInstallerJournalClaim(options.runtimeRoot, archivedInstaller);
+    const takeoverNonce = randomUUID();
+    await archiveInstallerJournalClaim({
+      runtimeRoot: options.runtimeRoot,
+      txid: options.journal.txid,
+      installerNonce: takeoverNonce,
+      serialized: options.transactionJournalBytes,
+    });
+    installerLease = await acquireInstallerLease({
+      runtimeRoot: options.runtimeRoot,
+      txid: options.journal.txid,
+      operation: options.journal.operation,
+      installerNonce: takeoverNonce,
+      previousInstallerNonce: archivedInstaller.metadata.installerNonce,
+      transactionJournalSha256: options.transactionJournalSha256,
+    });
+  }
+
+  try {
+    const maintenanceLease = await replaceStaleMarker({
+      snapshot: maintenanceSnapshot,
+      archiveDirectoryName: maintenanceArchiveDirectoryName,
+      archiveFilename: `${options.journal.txid}-${options.journal.maintenanceNonce}.json`,
+      metadata: {
+        ...maintenanceSnapshot.metadata,
+        pid: process.pid,
+        processStartedAt,
+        acquiredAt: new Date().toISOString(),
+      },
+      LeaseClass: PersistentMaintenanceLease,
+      parseMetadata: parseMaintenanceMetadata,
+      sameMetadata: sameMaintenanceMetadata,
+      ambiguousCode: "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS",
+    });
+    return { installerLease, maintenanceLease, forensic: true };
+  } catch (error) {
+    await installerLease.release();
+    throw error;
+  }
+}
+
+async function removeDuplicateStagedMaintenance(runtimeRoot, journal, snapshot) {
+  const stateDirectory = path.join(runtimeRoot, "state");
+  const stagedPath = path.join(
+    stateDirectory,
+    `.live-operation.lock.${journal.txid}.${journal.maintenanceNonce}.staged`,
+  );
+  const identity = await lstat(stagedPath).catch((error) => {
+    if (isNodeError(error) && error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (identity === null) return;
+  try {
+    assertExactRegularFile(identity, snapshot.device, snapshot.inode);
+    await unlink(stagedPath);
+    await syncDirectory(stateDirectory);
+  } catch (error) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+  }
+}
+
+async function replaceRecoverableStagedMaintenance(options) {
+  const stateDirectory = path.join(options.runtimeRoot, "state");
+  const stagedPath = path.join(
+    stateDirectory,
+    `.live-operation.lock.${options.journal.txid}.${options.journal.maintenanceNonce}.staged`,
+  );
+  const archiveDirectory = path.join(
+    stateDirectory,
+    maintenanceArchiveDirectoryName,
+  );
+  const archivePath = path.join(
+    archiveDirectory,
+    `${options.journal.txid}-${options.journal.maintenanceNonce}.json`,
+  );
+  const stagedExists = await pathExists(stagedPath);
+  const archivedExists = await pathExists(archivePath);
+  if (!stagedExists && !archivedExists) {
+    if (!options.allowMissingPriorMarker) {
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+    }
+    return acquireMaintenanceLease({
+      runtimeRoot: options.runtimeRoot,
+      txid: options.journal.txid,
+      maintenanceNonce: options.journal.maintenanceNonce,
+    });
+  }
+  const snapshot = await readMarkerSnapshot(
+    stagedExists ? stagedPath : archivePath,
+    parseMaintenanceMetadata,
+    "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS",
+  );
+  assertMaintenanceSnapshotMatchesJournal(snapshot, options.journal);
+  if (
+    snapshot.metadata.pid !== options.installerMetadata.pid
+    || snapshot.metadata.processStartedAt !== options.installerMetadata.processStartedAt
+  ) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+  await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+  if (stagedExists && !archivedExists) {
+    await link(stagedPath, archivePath);
+  }
+  const archiveIdentity = await lstat(archivePath);
+  assertExactRegularFile(archiveIdentity, snapshot.device, snapshot.inode);
+  await syncDirectory(archiveDirectory);
+  if (stagedExists) {
+    const currentStagedIdentity = await lstat(stagedPath);
+    assertExactRegularFile(
+      currentStagedIdentity,
+      snapshot.device,
+      snapshot.inode,
+    );
+    await unlink(stagedPath);
+    await syncDirectory(stateDirectory);
+  }
+  return acquireMaintenanceLease({
+    runtimeRoot: options.runtimeRoot,
+    txid: options.journal.txid,
+    maintenanceNonce: options.journal.maintenanceNonce,
+  });
+}
+
+async function assertDeadOwner(metadata, inspectOwnerIdentityOption, busyCode, ambiguousCode) {
+  const inspectOwnerIdentity = inspectOwnerIdentityOption ?? inspectProcessOwnerIdentity;
+  let ownerIdentity;
+  try {
+    ownerIdentity = await inspectOwnerIdentity({
+      pid: metadata.pid,
+      processStartedAt: metadata.processStartedAt,
+    });
+  } catch (error) {
+    throw new Error(ambiguousCode, { cause: error });
+  }
+  if (ownerIdentity === "alive-exact") throw new Error(busyCode);
+  if (ownerIdentity !== "dead") throw new Error(ambiguousCode);
+}
+
+async function archiveInstallerJournalClaim(options) {
+  const stateDirectory = path.join(options.runtimeRoot, "state");
+  const archiveDirectory = path.join(
+    stateDirectory,
+    installerArchiveDirectoryName,
+  );
+  const claimPath = path.join(
+    archiveDirectory,
+    `${options.txid}-${options.installerNonce}.journal.json`,
+  );
+  await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+  const existing = await lstat(claimPath).catch((error) => {
+    if (isNodeError(error) && error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (existing !== null) {
+    const serialized = await readBoundedRegularFile(
+      claimPath,
+      existing,
+      "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+    );
+    if (serialized !== options.serialized) {
+      throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+    }
+    return;
+  }
+  const temporaryPath = path.join(
+    archiveDirectory,
+    `.${path.basename(claimPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", 0o400);
+    await handle.writeFile(options.serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, claimPath);
+    await syncDirectory(archiveDirectory);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function assertInstallerJournalClaim(runtimeRoot, installerSnapshot) {
+  const expectedSha256 = installerSnapshot.metadata.transactionJournalSha256;
+  if (expectedSha256 === null) return;
+  const claimPath = path.join(
+    runtimeRoot,
+    "state",
+    installerArchiveDirectoryName,
+    `${installerSnapshot.metadata.txid}-${installerSnapshot.metadata.installerNonce}.journal.json`,
+  );
+  const identity = await lstat(claimPath).catch((error) => {
+    throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS", { cause: error });
+  });
+  const serialized = await readBoundedRegularFile(
+    claimPath,
+    identity,
+    "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+  );
+  if (sha256Text(serialized) !== expectedSha256) {
+    throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+  }
+}
+
+function assertInstallerSnapshotMatchesJournal(snapshot, journal) {
+  const expected = journal.installerClaim;
+  if (
+    snapshot.metadata.txid !== journal.txid
+    || snapshot.metadata.operation !== journal.operation
+    || String(snapshot.device) !== expected.device
+    || String(snapshot.inode) !== expected.inode
+    || snapshot.metadata.installerNonce !== expected.nonce
+    || snapshot.metadata.previousInstallerNonce !== expected.previousNonce
+    || snapshot.metadata.transactionJournalSha256 !== expected.journalSha256
+  ) {
+    throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+  }
+}
+
+async function readBoundedRegularFile(filePath, expectedIdentity, ambiguousCode) {
+  if (!expectedIdentity.isFile() || expectedIdentity.isSymbolicLink()) {
+    throw new Error(ambiguousCode);
+  }
+  let handle;
+  try {
+    handle = await open(
+      filePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const openedIdentity = await handle.stat();
+    assertExactRegularFile(
+      openedIdentity,
+      expectedIdentity.dev,
+      expectedIdentity.ino,
+    );
+    const serialized = await readBoundedText(handle, maximumTransactionJournalBytes);
+    const finalIdentity = await lstat(filePath);
+    assertExactRegularFile(
+      finalIdentity,
+      expectedIdentity.dev,
+      expectedIdentity.ino,
+    );
+    return serialized;
+  } catch (error) {
+    throw error instanceof Error && error.message === ambiguousCode
+      ? error
+      : new Error(ambiguousCode, { cause: error });
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function readMarkerSnapshot(lockPath, parseMetadata, ambiguousCode) {
+  let handle;
+  try {
+    const expectedIdentity = await lstat(lockPath);
+    if (!expectedIdentity.isFile() || expectedIdentity.isSymbolicLink()) {
+      throw new Error(ambiguousCode);
+    }
+    handle = await open(
+      lockPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const openedIdentity = await handle.stat();
+    assertExactRegularFile(openedIdentity, expectedIdentity.dev, expectedIdentity.ino);
+    const serialized = await readBounded(handle);
+    const metadata = parseMetadata(serialized);
+    const finalIdentity = await lstat(lockPath);
+    assertExactRegularFile(finalIdentity, expectedIdentity.dev, expectedIdentity.ino);
+    return {
+      lockPath,
+      stateDirectory: path.dirname(lockPath),
+      device: expectedIdentity.dev,
+      inode: expectedIdentity.ino,
+      serialized,
+      metadata,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message === ambiguousCode) throw error;
+    throw new Error(ambiguousCode, { cause: error });
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function assertMaintenanceSnapshotMatchesJournal(snapshot, journal) {
+  const expected = journal.maintenanceLease;
+  if (
+    expected.path !== path.posix.join("state", "live-operation.lock") ||
+    expected.device !== String(snapshot.device) ||
+    expected.inode !== String(snapshot.inode) ||
+    expected.nonce !== snapshot.metadata.maintenanceNonce ||
+    expected.pid !== snapshot.metadata.pid ||
+    expected.processStartedAt !== snapshot.metadata.processStartedAt ||
+    journal.txid !== snapshot.metadata.txid ||
+    journal.maintenanceNonce !== snapshot.metadata.maintenanceNonce
+  ) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+}
+
+async function replaceStaleMarker(options) {
+  const archiveDirectory = path.join(
+    options.snapshot.stateDirectory,
+    options.archiveDirectoryName,
+  );
+  const archivePath = path.join(archiveDirectory, options.archiveFilename);
+  const temporaryPath = path.join(
+    options.snapshot.stateDirectory,
+    `.${path.basename(options.snapshot.lockPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let replacementHandle;
+  try {
+    await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+    await syncDirectory(options.snapshot.stateDirectory);
+    try {
+      await link(options.snapshot.lockPath, archivePath);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+      const archivedIdentity = await lstat(archivePath);
+      assertExactRegularFile(
+        archivedIdentity,
+        options.snapshot.device,
+        options.snapshot.inode,
+      );
+    }
+    const archiveIdentity = await lstat(archivePath);
+    assertExactRegularFile(
+      archiveIdentity,
+      options.snapshot.device,
+      options.snapshot.inode,
+    );
+    await syncDirectory(archiveDirectory);
+
+    replacementHandle = await open(temporaryPath, "wx", 0o600);
+    await replacementHandle.writeFile(JSON.stringify(options.metadata), "utf8");
+    await replacementHandle.sync();
+    const replacementIdentity = await replacementHandle.stat();
+    await assertMarkerSnapshotCurrent(
+      options.snapshot,
+      options.parseMetadata,
+      options.sameMetadata,
+      options.ambiguousCode,
+    );
+    await rename(temporaryPath, options.snapshot.lockPath);
+    await syncDirectory(options.snapshot.stateDirectory);
+    const installedIdentity = await lstat(options.snapshot.lockPath);
+    assertExactRegularFile(
+      installedIdentity,
+      replacementIdentity.dev,
+      replacementIdentity.ino,
+    );
+    return new options.LeaseClass({
+      lockPath: options.snapshot.lockPath,
+      stateDirectory: options.snapshot.stateDirectory,
+      handle: replacementHandle,
+      device: replacementIdentity.dev,
+      inode: replacementIdentity.ino,
+      metadata: options.metadata,
+    });
+  } catch (error) {
+    await replacementHandle?.close().catch(() => undefined);
+    if (error instanceof Error && error.message === options.ambiguousCode) throw error;
+    throw new Error(options.ambiguousCode, { cause: error });
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function assertMarkerSnapshotCurrent(
+  snapshot,
+  parseMetadata,
+  sameMetadata,
+  ambiguousCode,
+) {
+  const current = await readMarkerSnapshot(snapshot.lockPath, parseMetadata, ambiguousCode);
+  if (
+    current.device !== snapshot.device ||
+    current.inode !== snapshot.inode ||
+    current.serialized !== snapshot.serialized ||
+    !sameMetadata(current.metadata, snapshot.metadata)
+  ) {
+    throw new Error(ambiguousCode);
+  }
+}
+
+async function pathExists(targetPath) {
+  try {
+    await lstat(targetPath);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+class StagedMaintenanceLease {
+  constructor(options) {
+    this.stagedPath = options.stagedPath;
+    this.lockPath = options.lockPath;
+    this.stateDirectory = options.stateDirectory;
+    this.handle = options.handle;
+    this.device = options.device;
+    this.inode = options.inode;
+    this.metadata = options.metadata;
+    this.completed = false;
+  }
+
+  async publish() {
+    if (this.completed) throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+    try {
+      await link(this.stagedPath, this.lockPath);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "EEXIST") {
+        throw new Error("RELEASE_RUNTIME_BUSY", { cause: error });
+      }
+      throw error;
+    }
+    try {
+      const published = await lstat(this.lockPath);
+      assertExactRegularFile(published, this.device, this.inode);
+      await syncDirectory(this.stateDirectory);
+      await unlink(this.stagedPath);
+      await syncDirectory(this.stateDirectory);
+      this.completed = true;
+      return new PersistentMaintenanceLease({
+        lockPath: this.lockPath,
+        stateDirectory: this.stateDirectory,
+        handle: this.handle,
+        device: this.device,
+        inode: this.inode,
+        metadata: this.metadata,
+      });
+    } catch (error) {
+      await unlink(this.lockPath).catch(() => undefined);
+      await syncDirectory(this.stateDirectory).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async discard() {
+    if (this.completed) return;
+    this.completed = true;
+    await removeCreatedMarker(
+      this.stagedPath,
+      this.stateDirectory,
+      this.handle,
+    );
+  }
+}
+
+class PersistentMaintenanceLease {
+  constructor(options) {
+    this.lockPath = options.lockPath;
+    this.stateDirectory = options.stateDirectory;
+    this.handle = options.handle;
+    this.device = options.device;
+    this.inode = options.inode;
+    this.metadata = options.metadata;
+    this.releasePromise = null;
+    this.retainPromise = null;
+    this.identity = Object.freeze({
+      device: String(options.device),
+      inode: String(options.inode),
+      nonce: options.metadata.maintenanceNonce,
+      txid: options.metadata.txid,
+    });
+  }
+
+  release() {
+    if (this.releasePromise === null) this.releasePromise = this.releaseExactMarker();
+    return this.releasePromise;
+  }
+
+  retain() {
+    if (this.releasePromise !== null) {
+      return Promise.reject(new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS"));
+    }
+    if (this.retainPromise === null) this.retainPromise = this.retainExactMarker();
+    return this.retainPromise;
+  }
+
+  async retainExactMarker() {
+    let verificationHandle = null;
+    try {
+      const initialPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(initialPathIdentity, this.device, this.inode);
+      const ownedIdentity = await this.handle.stat();
+      assertExactRegularFile(ownedIdentity, this.device, this.inode);
+      verificationHandle = await open(
+        this.lockPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const verificationIdentity = await verificationHandle.stat();
+      assertExactRegularFile(verificationIdentity, this.device, this.inode);
+      const serialized = await readBounded(verificationHandle);
+      const currentMetadata = parseMaintenanceMetadata(serialized);
+      if (!sameMaintenanceMetadata(currentMetadata, this.metadata)) {
+        throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+      }
+      const finalPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(finalPathIdentity, this.device, this.inode);
+    } catch (error) {
+      if (error instanceof Error && error.message === "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS") {
+        throw error;
+      }
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+    } finally {
+      await verificationHandle?.close().catch(() => undefined);
+      await this.handle.close().catch(() => undefined);
+    }
+  }
+
+  async releaseExactMarker() {
+    let verificationHandle = null;
+    try {
+      const initialPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(initialPathIdentity, this.device, this.inode);
+      const ownedIdentity = await this.handle.stat();
+      assertExactRegularFile(ownedIdentity, this.device, this.inode);
+
+      verificationHandle = await open(
+        this.lockPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const verificationIdentity = await verificationHandle.stat();
+      assertExactRegularFile(verificationIdentity, this.device, this.inode);
+      const serialized = await readBounded(verificationHandle);
+      const currentMetadata = parseMaintenanceMetadata(serialized);
+      if (!sameMaintenanceMetadata(currentMetadata, this.metadata)) {
+        throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+      }
+
+      const finalPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(finalPathIdentity, this.device, this.inode);
+      await unlink(this.lockPath);
+      await syncDirectory(this.stateDirectory);
+    } catch (error) {
+      if (error instanceof Error && error.message === "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS") {
+        throw error;
+      }
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+    } finally {
+      await verificationHandle?.close().catch(() => undefined);
+      await this.handle.close().catch(() => undefined);
+    }
+  }
+}
+
+class PersistentInstallerLease {
+  constructor(options) {
+    this.lockPath = options.lockPath;
+    this.stateDirectory = options.stateDirectory;
+    this.handle = options.handle;
+    this.device = options.device;
+    this.inode = options.inode;
+    this.metadata = options.metadata;
+    this.releasePromise = null;
+  }
+
+  release() {
+    if (this.releasePromise === null) this.releasePromise = this.releaseExactMarker();
+    return this.releasePromise;
+  }
+
+  async releaseExactMarker() {
+    let verificationHandle = null;
+    try {
+      const initialPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(initialPathIdentity, this.device, this.inode);
+      const ownedIdentity = await this.handle.stat();
+      assertExactRegularFile(ownedIdentity, this.device, this.inode);
+      verificationHandle = await open(
+        this.lockPath,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const verificationIdentity = await verificationHandle.stat();
+      assertExactRegularFile(verificationIdentity, this.device, this.inode);
+      const metadata = parseInstallerMetadata(await readBounded(verificationHandle));
+      if (!sameInstallerMetadata(metadata, this.metadata)) {
+        throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+      }
+      const finalPathIdentity = await lstat(this.lockPath);
+      assertExactRegularFile(finalPathIdentity, this.device, this.inode);
+      const archiveDirectory = path.join(
+        this.stateDirectory,
+        installerArchiveDirectoryName,
+      );
+      const archivePath = path.join(
+        archiveDirectory,
+        `${this.metadata.txid}-${this.metadata.installerNonce}.json`,
+      );
+      await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+      try {
+        await link(this.lockPath, archivePath);
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+        const archivedIdentity = await lstat(archivePath);
+        assertExactRegularFile(archivedIdentity, this.device, this.inode);
+      }
+      const archiveIdentity = await lstat(archivePath);
+      assertExactRegularFile(archiveIdentity, this.device, this.inode);
+      await syncDirectory(archiveDirectory);
+      await unlink(this.lockPath);
+      await syncDirectory(this.stateDirectory);
+    } catch (error) {
+      if (error instanceof Error && error.message === "RELEASE_INSTALLER_LEASE_AMBIGUOUS") {
+        throw error;
+      }
+      throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS", { cause: error });
+    } finally {
+      await verificationHandle?.close().catch(() => undefined);
+      await this.handle.close().catch(() => undefined);
+    }
+  }
+}
+
+function parseCommitDecision(serialized) {
+  return parseAutomationDecision(serialized, "commit");
+}
+
+function parseAutomationDecision(serialized, expectedOperation) {
+  try {
+    if (typeof serialized !== "string") throw new Error("NOT_A_STRING");
+    const value = JSON.parse(serialized);
+    assertExactKeys(value, ["automationObservation", "maintenanceNonce", "op", "txid"]);
+    if (value.op !== expectedOperation) throw new Error("WRONG_OPERATION");
+    assertUuid(value.txid);
+    assertUuid(value.maintenanceNonce);
+
+    const observation = value.automationObservation;
+    assertExactKeys(observation, [
+      "automationId",
+      "observedAt",
+      "observationId",
+      "requestId",
+      "status",
+      "targetCount",
+    ]);
+    assertUuid(observation.requestId);
+    assertUuid(observation.observationId);
+    if (
+      observation.automationId !== "automation" ||
+      observation.targetCount !== 1 ||
+      observation.status !== "PAUSED" ||
+      !isIsoDateTime(observation.observedAt)
+    ) {
+      throw new Error("INVALID_AUTOMATION_OBSERVATION");
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof Error && error.message === "RELEASE_COMMIT_DECISION_REPLAYED") {
+      throw error;
+    }
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID", { cause: error });
+  }
+}
+
+function prepareTransactionContext(options, candidateRequired) {
+  try {
+    const usesFixtureDecisions = options?.readDecision === undefined;
+    if (
+      typeof options?.runtimeRoot !== "string" ||
+      options.runtimeRoot.length === 0 ||
+      typeof options.now !== "function" ||
+      typeof options.validateRelease !== "function" ||
+      options.automationId !== "automation" ||
+      (usesFixtureDecisions
+        ? (!Array.isArray(options.decisionLines) ||
+          options.decisionLines.length !== 2 ||
+          options.decisionLines.some((line) => typeof line !== "string") ||
+          options.session === undefined)
+        : (typeof options.readDecision !== "function" ||
+          options.decisionLines !== undefined ||
+          options.session !== undefined)) ||
+      (candidateRequired && (
+        typeof options.candidateRoot !== "string" ||
+        options.candidateRoot.length === 0
+      )) ||
+      (options.hook !== undefined && typeof options.hook !== "function")
+    ) {
+      throw new Error("INVALID_TRANSACTION_OPTIONS");
+    }
+    const now = options.now();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error("INVALID_TRANSACTION_CLOCK");
+    }
+    const session = usesFixtureDecisions
+      ? parseFixtureDecisionSession(options.session)
+      : {
+        txid: randomUUID(),
+        maintenanceNonce: randomUUID(),
+        precheckRequestId: randomUUID(),
+        precheckObservationId: randomUUID(),
+        precheckRequestedAt: now.toISOString(),
+        commitRequestId: null,
+        commitObservationId: null,
+        commitRequestedAt: null,
+      };
+    return {
+      runtimeRoot: path.resolve(options.runtimeRoot),
+      automationId: options.automationId,
+      decisionLines: usesFixtureDecisions ? options.decisionLines : null,
+      readDecision: usesFixtureDecisions ? null : options.readDecision,
+      session,
+      now: options.now,
+      fixtureMode: usesFixtureDecisions,
+    };
+  } catch (error) {
+    throw new Error("RELEASE_TRANSACTION_INVALID", { cause: error });
+  }
+}
+
+function prepareRecoveryTransactionContext(options, journal) {
+  const now = options.now();
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new Error("RELEASE_TRANSACTION_INVALID");
+  }
+  return {
+    runtimeRoot: path.resolve(options.runtimeRoot),
+    automationId: "automation",
+    decisionLines: null,
+    readDecision: options.readDecision,
+    session: {
+      txid: journal.txid,
+      maintenanceNonce: journal.maintenanceNonce,
+      precheckRequestId: randomUUID(),
+      precheckObservationId: randomUUID(),
+      precheckRequestedAt: now.toISOString(),
+      commitRequestId: null,
+      commitObservationId: null,
+      commitRequestedAt: null,
+    },
+    now: options.now,
+    fixtureMode: false,
+  };
+}
+
+function parseFixtureDecisionSession(session) {
+  assertExactKeys(session, [
+    "commitObservationId",
+    "commitRequestId",
+    "commitRequestedAt",
+    "maintenanceNonce",
+    "precheckObservationId",
+    "precheckRequestId",
+    "precheckRequestedAt",
+    "txid",
+  ]);
+  assertUuid(session.txid);
+  assertUuid(session.maintenanceNonce);
+  assertUuid(session.precheckRequestId);
+  assertUuid(session.precheckObservationId);
+  assertUuid(session.commitRequestId);
+  assertUuid(session.commitObservationId);
+  if (
+    session.precheckObservationId === session.commitObservationId ||
+    !isIsoDateTime(session.precheckRequestedAt) ||
+    !isIsoDateTime(session.commitRequestedAt) ||
+    Date.parse(session.precheckRequestedAt) > Date.parse(session.commitRequestedAt)
+  ) {
+    throw new Error("INVALID_TRANSACTION_SESSION");
+  }
+  return { ...session };
+}
+
+async function readTransactionDecision(context, operation) {
+  if (context.fixtureMode) {
+    return context.decisionLines[operation === "precheck" ? 0 : 1];
+  }
+  const request = {
+    op: operation,
+    txid: context.session.txid,
+    maintenanceNonce: context.session.maintenanceNonce,
+    requestId: context.session[`${operation}RequestId`],
+    observationId: context.session[`${operation}ObservationId`],
+    requestedAt: context.session[`${operation}RequestedAt`],
+  };
+  const serialized = await context.readDecision(Object.freeze(request));
+  if (typeof serialized !== "string") {
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID");
+  }
+  return serialized;
+}
+
+function prepareCommitDecisionRequest(context) {
+  if (context.fixtureMode) return;
+  const now = context.now();
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID");
+  }
+  context.session.commitRequestId = randomUUID();
+  do {
+    context.session.commitObservationId = randomUUID();
+  } while (context.session.commitObservationId === context.session.precheckObservationId);
+  context.session.commitRequestedAt = now.toISOString();
+}
+
+function acceptTransactionDecision(
+  serialized,
+  operation,
+  requestId,
+  observationId,
+  requestedAt,
+  context,
+) {
+  const decision = parseAutomationDecision(serialized, operation);
+  const observedAt = Date.parse(decision.automationObservation.observedAt);
+  const requestTime = Date.parse(requestedAt);
+  const now = context.now();
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID");
+  }
+  if (
+    decision.txid !== context.session.txid ||
+    decision.maintenanceNonce !== context.session.maintenanceNonce ||
+    decision.automationObservation.requestId !== requestId ||
+    decision.automationObservation.observationId !== observationId ||
+    decision.automationObservation.automationId !== context.automationId ||
+    observedAt < requestTime ||
+    observedAt > now.getTime() ||
+    now.getTime() - observedAt > transactionDecisionMaximumAgeMs
+  ) {
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID");
+  }
+  return decision;
+}
+
+function transactionDecisionKey(context) {
+  const session = context.session;
+  if (
+    typeof session.commitRequestId !== "string" ||
+    typeof session.commitObservationId !== "string"
+  ) {
+    return null;
+  }
+  return [
+    session.txid,
+    session.maintenanceNonce,
+    session.precheckRequestId,
+    session.precheckObservationId,
+    session.commitRequestId,
+    session.commitObservationId,
+  ].join(":");
+}
+
+function assertTransactionDecisionNotConsumed(context) {
+  const key = transactionDecisionKey(context);
+  if (key !== null && consumedTransactionDecisions.has(key)) {
+    throw new Error("RELEASE_COMMIT_DECISION_REPLAYED");
+  }
+}
+
+async function assertTransactionDecisionNotArchived(runtimeRoot, txid) {
+  const archiveDirectory = path.join(
+    runtimeRoot,
+    "state",
+    transactionArchiveDirectoryName,
+  );
+  for (const operation of ["install", "rollback"]) {
+    const archivePath = path.join(archiveDirectory, `${txid}-${operation}.json`);
+    try {
+      await lstat(archivePath);
+      throw new Error("RELEASE_COMMIT_DECISION_REPLAYED");
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+}
+
+function markTransactionDecisionConsumed(context) {
+  const key = transactionDecisionKey(context);
+  if (key === null || consumedTransactionDecisions.has(key)) {
+    throw new Error("RELEASE_COMMIT_DECISION_REPLAYED");
+  }
+  consumedTransactionDecisions.add(key);
+}
+
+function manifestSha256FromValidation(result) {
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    typeof result.manifestSha256 !== "string" ||
+    !manifestSha256Pattern.test(result.manifestSha256)
+  ) {
+    throw new Error("RELEASE_VALIDATOR_RESULT_INVALID");
+  }
+  return result.manifestSha256;
+}
+
+function absentState() {
+  return { kind: "absent" };
+}
+
+function validatedState(target, manifestSha256, releaseRoot = undefined) {
+  return {
+    kind: "validated",
+    target,
+    manifestSha256,
+    ...(releaseRoot === undefined ? {} : { releaseRoot }),
+  };
+}
+
+function serializablePointerState(state) {
+  if (state.kind === "absent" || state.kind === "legacy") {
+    return { kind: state.kind };
+  }
+  if (state.kind === "validated") {
+    return {
+      kind: "validated",
+      target: state.target,
+      manifestSha256: state.manifestSha256,
+    };
+  }
+  throw new Error("RELEASE_POINTER_STATE_INVALID");
+}
+
+function createTransactionJournalRecord(options) {
+  return {
+    version: 2,
+    txid: options.context.session.txid,
+    maintenanceNonce: options.context.session.maintenanceNonce,
+    operation: options.operation,
+    phase: "prepared",
+    candidate: options.candidate === null
+      ? null
+      : serializablePointerState(options.candidate),
+    candidateStagingTarget: options.candidateStagingTarget ?? null,
+    candidateStagingIdentity: options.candidateStagingIdentity ?? null,
+    before: {
+      current: serializablePointerState(options.beforeCurrent),
+      previous: serializablePointerState(options.beforePrevious),
+    },
+    desired: {
+      current: serializablePointerState(options.desiredCurrent),
+      previous: serializablePointerState(options.desiredPrevious),
+    },
+    legacyTarget: options.legacyTarget,
+    installerClaim: installerLeaseJournalIdentity(options.installerLease),
+    maintenanceLease: maintenanceLeaseJournalIdentity(options.maintenanceLease),
+    automationObservations: {
+      precheck: { ...options.precheckDecision.automationObservation },
+      commit: options.commitDecision === null
+        ? null
+        : { ...options.commitDecision.automationObservation },
+    },
+    recoveryAutomationObservations: null,
+  };
+}
+
+function createMaintenanceStagedJournalRecord(options) {
+  return {
+    version: 2,
+    txid: options.context.session.txid,
+    maintenanceNonce: options.context.session.maintenanceNonce,
+    operation: options.operation,
+    phase: "maintenance-staged",
+    candidate: options.candidate === null
+      ? null
+      : serializablePointerState(options.candidate),
+    candidateStagingTarget: options.candidateStagingTarget ?? null,
+    candidateStagingIdentity: options.candidateStagingIdentity ?? null,
+    before: null,
+    desired: null,
+    legacyTarget: null,
+    installerClaim: installerLeaseJournalIdentity(options.installerLease),
+    maintenanceLease: maintenanceLeaseJournalIdentity(options.maintenanceLease),
+    automationObservations: {
+      precheck: { ...options.precheckDecision.automationObservation },
+      commit: null,
+    },
+    recoveryAutomationObservations: null,
+  };
+}
+
+function maintenanceLeaseJournalIdentity(lease) {
+  return {
+    path: path.posix.join("state", "live-operation.lock"),
+    device: String(lease.device),
+    inode: String(lease.inode),
+    nonce: lease.metadata.maintenanceNonce,
+    pid: lease.metadata.pid,
+    processStartedAt: lease.metadata.processStartedAt,
+  };
+}
+
+function installerLeaseJournalIdentity(lease) {
+  return {
+    device: String(lease.device),
+    inode: String(lease.inode),
+    nonce: lease.metadata.installerNonce,
+    previousNonce: lease.metadata.previousInstallerNonce,
+    journalSha256: lease.metadata.transactionJournalSha256,
+  };
+}
+
+function transactionHookContext(context, lease) {
+  return Object.freeze({
+    txid: context.session.txid,
+    maintenanceNonce: context.session.maintenanceNonce,
+    maintenanceLease: maintenanceLeaseJournalIdentity(lease),
+  });
+}
+
+async function assertSameFileSystem(leftPath, rightPath) {
+  const [left, right] = await Promise.all([stat(leftPath), stat(rightPath)]);
+  if (left.dev !== right.dev) throw new Error("RELEASE_CROSS_DEVICE_TRANSACTION");
+}
+
+async function assertControlledStagingCandidate(runtimeRoot, candidateRoot) {
+  const resolvedRuntimeRoot = path.resolve(runtimeRoot);
+  const releaseStore = path.join(resolvedRuntimeRoot, ".releases");
+  const resolvedCandidate = path.resolve(candidateRoot);
+  const relative = path.relative(releaseStore, resolvedCandidate);
+  if (
+    relative.length === 0
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative)
+    || relative.includes(path.sep)
+    || !relative.startsWith(".staging-")
+  ) {
+    throw new Error("RELEASE_CANDIDATE_OUTSIDE_STAGING");
+  }
+  const [runtimeIdentity, storeIdentity, candidateIdentity] = await Promise.all([
+    lstat(resolvedRuntimeRoot),
+    lstat(releaseStore),
+    lstat(resolvedCandidate),
+  ]).catch((error) => {
+    throw new Error("RELEASE_CANDIDATE_OUTSIDE_STAGING", { cause: error });
+  });
+  if (
+    !runtimeIdentity.isDirectory()
+    || runtimeIdentity.isSymbolicLink()
+    || !storeIdentity.isDirectory()
+    || storeIdentity.isSymbolicLink()
+    || !candidateIdentity.isDirectory()
+    || candidateIdentity.isSymbolicLink()
+  ) {
+    throw new Error("RELEASE_CANDIDATE_OUTSIDE_STAGING");
+  }
+  const [realStore, realCandidate] = await Promise.all([
+    realpath(releaseStore),
+    realpath(resolvedCandidate),
+  ]);
+  if (
+    realCandidate !== path.join(realStore, relative)
+    || runtimeIdentity.dev !== storeIdentity.dev
+    || storeIdentity.dev !== candidateIdentity.dev
+  ) {
+    throw new Error("RELEASE_CROSS_DEVICE_TRANSACTION");
+  }
+  return realCandidate;
+}
+
+async function moveImmutableCandidate(candidateRoot, releaseRoot, hook) {
+  const sourceIdentity = await immutableDirectoryIdentity(candidateRoot);
+  let moved = false;
+  try {
+    // Observed Darwin rename semantics require write permission on this root.
+    // candidate-moving is already durable; payload children remain immutable.
+    await chmod(candidateRoot, 0o755);
+    await hook?.("candidate-root-thawed");
+    await rename(candidateRoot, releaseRoot);
+    moved = true;
+    await hook?.("candidate-renamed");
+    await chmod(releaseRoot, 0o555);
+    await assertDirectoryIdentity(releaseRoot, sourceIdentity, true);
+    await Promise.all([
+      syncDirectory(path.dirname(candidateRoot)),
+      syncDirectory(path.dirname(releaseRoot)),
+    ]);
+  } catch (error) {
+    await chmod(moved ? releaseRoot : candidateRoot, 0o555).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function immutableDirectoryIdentity(directory) {
+  const identity = await lstat(directory);
+  if (
+    !identity.isDirectory()
+    || identity.isSymbolicLink()
+    || (identity.mode & 0o777) !== 0o555
+  ) {
+    throw new Error("RELEASE_PAYLOAD_MODE_POLICY_INVALID");
+  }
+  return { device: String(identity.dev), inode: String(identity.ino) };
+}
+
+async function assertDirectoryIdentity(directory, expected, requireImmutable) {
+  const identity = await lstat(directory);
+  if (
+    !identity.isDirectory()
+    || identity.isSymbolicLink()
+    || String(identity.dev) !== expected.device
+    || String(identity.ino) !== expected.inode
+    || (requireImmutable && (identity.mode & 0o777) !== 0o555)
+  ) {
+    throw new Error("RELEASE_CANDIDATE_MOVE_AMBIGUOUS");
+  }
+}
+
+async function stabilizeCandidateMoveState(runtimeRoot, journal, validateRelease) {
+  if (
+    journal.operation !== "install"
+    || journal.candidate === null
+    || journal.candidateStagingTarget === null
+    || journal.candidateStagingIdentity === null
+  ) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  const stagingRoot = path.resolve(runtimeRoot, journal.candidateStagingTarget);
+  const releaseRoot = path.resolve(runtimeRoot, journal.candidate.target);
+  const [stagingExists, releaseExists] = await Promise.all([
+    pathExists(stagingRoot),
+    pathExists(releaseRoot),
+  ]);
+  if (stagingExists === releaseExists) {
+    throw new Error("RELEASE_CANDIDATE_MOVE_AMBIGUOUS");
+  }
+  const observedRoot = stagingExists ? stagingRoot : releaseRoot;
+  await assertDirectoryIdentity(
+    observedRoot,
+    journal.candidateStagingIdentity,
+    false,
+  );
+  await chmod(observedRoot, 0o555);
+  await syncDirectory(path.dirname(observedRoot));
+  await assertDirectoryIdentity(
+    observedRoot,
+    journal.candidateStagingIdentity,
+    true,
+  );
+  const manifestSha256 = manifestSha256FromValidation(
+    await validateRelease(observedRoot),
+  );
+  if (manifestSha256 !== journal.candidate.manifestSha256) {
+    throw new Error("RELEASE_CANDIDATE_CHANGED_DURING_MOVE");
+  }
+}
+
+async function inspectCurrentState(runtimeRoot, validateRelease) {
+  const pointer = path.join(runtimeRoot, "bin");
+  let identity;
+  try {
+    identity = await lstat(pointer);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return absentState();
+    throw error;
+  }
+  if (identity.isSymbolicLink()) {
+    return inspectValidatedPointer(runtimeRoot, "bin", validateRelease);
+  }
+  if (identity.isDirectory()) return { kind: "legacy" };
+  throw new Error("RELEASE_CURRENT_POINTER_INVALID");
+}
+
+async function inspectPreviousState(runtimeRoot, validateRelease) {
+  const pointer = path.join(runtimeRoot, "bin.previous");
+  try {
+    const identity = await lstat(pointer);
+    if (!identity.isSymbolicLink()) throw new Error("INVALID_PREVIOUS_POINTER");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return absentState();
+    throw error;
+  }
+  return inspectValidatedPointer(runtimeRoot, "bin.previous", validateRelease);
+}
+
+async function inspectValidatedPointer(runtimeRoot, pointerName, validateRelease) {
+  const pointerPath = path.join(runtimeRoot, pointerName);
+  const target = await readlink(pointerPath);
+  const releaseRoot = await resolveControlledReleaseRoot(runtimeRoot, target);
+  const manifestSha256 = manifestSha256FromValidation(
+    await validateRelease(releaseRoot),
+  );
+  return validatedState(target, manifestSha256, releaseRoot);
+}
+
+async function resolveControlledReleaseRoot(runtimeRoot, target) {
+  if (
+    typeof target !== "string" ||
+    target.length === 0 ||
+    target.includes("\0") ||
+    path.isAbsolute(target)
+  ) {
+    throw new Error("RELEASE_POINTER_TARGET_INVALID");
+  }
+  const resolvedRuntimeRoot = await realpath(runtimeRoot);
+  const releaseStore = await realpath(path.join(resolvedRuntimeRoot, ".releases"));
+  const releaseRoot = path.resolve(resolvedRuntimeRoot, target);
+  const relative = path.relative(releaseStore, releaseRoot);
+  const canonicalReleaseName = /^[a-f0-9]{16}-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
+  if (
+    relative.length === 0 ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative) ||
+    relative.includes(path.sep) ||
+    !canonicalReleaseName.test(relative)
+  ) {
+    throw new Error("RELEASE_POINTER_TARGET_INVALID");
+  }
+  const identity = await lstat(releaseRoot);
+  if (!identity.isDirectory() || identity.isSymbolicLink()) {
+    throw new Error("RELEASE_POINTER_TARGET_INVALID");
+  }
+  const resolved = await realpath(releaseRoot);
+  if (path.dirname(resolved) !== releaseStore) {
+    throw new Error("RELEASE_POINTER_TARGET_INVALID");
+  }
+  return resolved;
+}
+
+async function migrateLegacyCurrent(runtimeRoot, legacyTarget) {
+  if (typeof legacyTarget !== "string") {
+    throw new Error("RELEASE_LEGACY_TARGET_INVALID");
+  }
+  const currentPath = path.join(runtimeRoot, "bin");
+  const legacyPath = path.resolve(runtimeRoot, legacyTarget);
+  const releaseStore = path.join(runtimeRoot, ".releases");
+  if (!isStrictDescendant(releaseStore, legacyPath)) {
+    throw new Error("RELEASE_LEGACY_TARGET_INVALID");
+  }
+  const identity = await lstat(currentPath);
+  if (!identity.isDirectory() || identity.isSymbolicLink()) {
+    throw new Error("RELEASE_LEGACY_SOURCE_INVALID");
+  }
+  await assertPathAbsent(legacyPath, "RELEASE_LEGACY_TARGET_EXISTS");
+  await rename(currentPath, legacyPath);
+  await Promise.all([syncDirectory(runtimeRoot), syncDirectory(releaseStore)]);
+}
+
+async function applyPointerState(runtimeRoot, pointerName, state, validateRelease) {
+  if (state.kind === "absent") {
+    await removePointerIfPresent(runtimeRoot, pointerName);
+    return;
+  }
+  if (state.kind !== "validated") {
+    throw new Error("RELEASE_POINTER_STATE_INVALID");
+  }
+  const releaseRoot = await resolveControlledReleaseRoot(runtimeRoot, state.target);
+  const manifestSha256 = manifestSha256FromValidation(await validateRelease(releaseRoot));
+  if (manifestSha256 !== state.manifestSha256) {
+    throw new Error("RELEASE_POINTER_MANIFEST_MISMATCH");
+  }
+  await atomicReplacePointer(runtimeRoot, pointerName, state.target);
+}
+
+async function restoreCurrentState(
+  runtimeRoot,
+  state,
+  legacyTarget,
+  validateRelease,
+) {
+  if (state.kind !== "legacy") {
+    await applyPointerState(runtimeRoot, "bin", state, validateRelease);
+    return;
+  }
+  if (typeof legacyTarget !== "string") {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  const currentPath = path.join(runtimeRoot, "bin");
+  try {
+    const currentIdentity = await lstat(currentPath);
+    if (currentIdentity.isDirectory() && !currentIdentity.isSymbolicLink()) return;
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+  }
+  const legacyPath = path.resolve(runtimeRoot, legacyTarget);
+  const legacyIdentity = await lstat(legacyPath);
+  if (!legacyIdentity.isDirectory() || legacyIdentity.isSymbolicLink()) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  await rename(legacyPath, currentPath);
+  await Promise.all([
+    syncDirectory(runtimeRoot),
+    syncDirectory(path.join(runtimeRoot, ".releases")),
+  ]);
+}
+
+async function atomicReplacePointer(runtimeRoot, pointerName, target) {
+  const pointerPath = path.join(runtimeRoot, pointerName);
+  const temporaryPath = path.join(
+    runtimeRoot,
+    `.${pointerName}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    await symlink(target, temporaryPath);
+    await rename(temporaryPath, pointerPath);
+    await syncDirectory(runtimeRoot);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function removePointerIfPresent(runtimeRoot, pointerName) {
+  const pointerPath = path.join(runtimeRoot, pointerName);
+  try {
+    const identity = await lstat(pointerPath);
+    if (!identity.isSymbolicLink()) {
+      throw new Error("RELEASE_POINTER_STATE_AMBIGUOUS");
+    }
+    await unlink(pointerPath);
+    await syncDirectory(runtimeRoot);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+}
+
+async function assertPointerMatches(runtimeRoot, pointerName, expected, validateRelease) {
+  if (expected.kind === "absent") {
+    try {
+      await lstat(path.join(runtimeRoot, pointerName));
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return;
+      throw error;
+    }
+    throw new Error("RELEASE_POINTER_STATE_AMBIGUOUS");
+  }
+  if (expected.kind !== "validated") {
+    throw new Error("RELEASE_POINTER_STATE_AMBIGUOUS");
+  }
+  const actual = await inspectValidatedPointer(runtimeRoot, pointerName, validateRelease);
+  if (
+    actual.target !== expected.target ||
+    actual.manifestSha256 !== expected.manifestSha256
+  ) {
+    throw new Error("RELEASE_POINTER_STATE_AMBIGUOUS");
+  }
+}
+
+async function createTransactionJournal(runtimeRoot, journal) {
+  await assertPathAbsent(
+    transactionJournalPath(runtimeRoot),
+    "RELEASE_TRANSACTION_PENDING",
+  );
+  await updateTransactionJournal(runtimeRoot, journal);
+}
+
+async function updateTransactionJournal(runtimeRoot, journal) {
+  const stateDirectory = path.join(runtimeRoot, "state");
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+  const journalPath = transactionJournalPath(runtimeRoot);
+  const temporaryPath = path.join(
+    stateDirectory,
+    `.${transactionJournalFilename}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(`${JSON.stringify(journal)}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, journalPath);
+    await syncDirectory(stateDirectory);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function readTransactionJournal(runtimeRoot) {
+  const journalPath = transactionJournalPath(runtimeRoot);
+  let expectedIdentity;
+  try {
+    expectedIdentity = await lstat(journalPath);
+  } catch (error) {
+    throw new Error("RELEASE_TRANSACTION_NOT_FOUND", { cause: error });
+  }
+  if (!expectedIdentity.isFile() || expectedIdentity.isSymbolicLink()) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  let handle;
+  try {
+    handle = await open(
+      journalPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const openedIdentity = await handle.stat();
+    assertExactRegularFile(
+      openedIdentity,
+      expectedIdentity.dev,
+      expectedIdentity.ino,
+    );
+    return await readBoundedText(handle, maximumTransactionJournalBytes);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function readRecoverableTransaction(runtimeRoot) {
+  try {
+    const initialBytes = await readTransactionJournal(runtimeRoot);
+    const journal = parseTransactionJournal(initialBytes);
+    const installerPath = path.join(
+      runtimeRoot,
+      "state",
+      installerLockFilename,
+    );
+    const installerSnapshotArchived = !(await pathExists(installerPath));
+    const installerSnapshot = !installerSnapshotArchived
+      ? await readMarkerSnapshot(
+        installerPath,
+        parseInstallerMetadata,
+        "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+      )
+      : await readMarkerSnapshot(
+        path.join(
+          runtimeRoot,
+          "state",
+          installerArchiveDirectoryName,
+          `${journal.txid}-${journal.installerClaim.nonce}.json`,
+        ),
+        parseInstallerMetadata,
+        "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+      );
+    if (
+      installerSnapshot.metadata.txid !== journal.txid
+      || installerSnapshot.metadata.operation !== journal.operation
+    ) {
+      throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+    }
+    assertInstallerSnapshotMatchesJournal(installerSnapshot, journal);
+    await assertInstallerJournalClaim(runtimeRoot, installerSnapshot);
+    return {
+      archived: false,
+      archivePath: null,
+      initialBytes,
+      journal,
+      installerSnapshot,
+      installerSnapshotArchived,
+    };
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "RELEASE_TRANSACTION_NOT_FOUND") {
+      throw error;
+    }
+  }
+
+  const stateDirectory = path.join(runtimeRoot, "state");
+  const maintenancePath = path.join(stateDirectory, "live-operation.lock");
+  const installerPath = path.join(stateDirectory, installerLockFilename);
+  let snapshot = null;
+  let installerSnapshot = null;
+  let txid;
+  let operation;
+  if (await pathExists(maintenancePath)) {
+    snapshot = await readMarkerSnapshot(
+      maintenancePath,
+      parseMaintenanceMetadata,
+      "RELEASE_MAINTENANCE_LEASE_AMBIGUOUS",
+    );
+    txid = snapshot.metadata.txid;
+  } else if (await pathExists(installerPath)) {
+    installerSnapshot = await readMarkerSnapshot(
+      installerPath,
+      parseInstallerMetadata,
+      "RELEASE_INSTALLER_LEASE_AMBIGUOUS",
+    );
+    txid = installerSnapshot.metadata.txid;
+    operation = installerSnapshot.metadata.operation;
+  } else {
+    throw new Error("RELEASE_TRANSACTION_NOT_FOUND");
+  }
+  const archiveDirectory = path.join(stateDirectory, transactionArchiveDirectoryName);
+  let archivePath;
+  if (operation !== undefined) {
+    archivePath = path.join(archiveDirectory, `${txid}-${operation}.json`);
+  } else {
+    const candidates = ["install", "rollback"].map((candidateOperation) => (
+      path.join(archiveDirectory, `${txid}-${candidateOperation}.json`)
+    ));
+    const existing = [];
+    for (const candidate of candidates) {
+      if (await pathExists(candidate)) existing.push(candidate);
+    }
+    if (existing.length !== 1) {
+      throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+    }
+    [archivePath] = existing;
+  }
+  const initialBytes = await readArchivedTransactionJournal(archivePath);
+  const journal = parseTransactionJournal(initialBytes);
+  if (snapshot !== null) assertMaintenanceSnapshotMatchesJournal(snapshot, journal);
+  if (
+    installerSnapshot !== null
+    && (
+      installerSnapshot.metadata.txid !== journal.txid
+      || installerSnapshot.metadata.operation !== journal.operation
+    )
+  ) {
+    throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS");
+  }
+  if (installerSnapshot !== null) {
+    assertInstallerSnapshotMatchesJournal(installerSnapshot, journal);
+    await assertInstallerJournalClaim(runtimeRoot, installerSnapshot);
+  }
+  return {
+    archived: true,
+    archivePath,
+    initialBytes,
+    journal,
+    installerSnapshot,
+    installerSnapshotArchived: false,
+  };
+}
+
+async function readArchivedTransactionJournal(archivePath) {
+  let expectedIdentity;
+  try {
+    expectedIdentity = await lstat(archivePath);
+  } catch (error) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS", { cause: error });
+  }
+  if (!expectedIdentity.isFile() || expectedIdentity.isSymbolicLink()) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  let handle;
+  try {
+    handle = await open(
+      archivePath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const openedIdentity = await handle.stat();
+    assertExactRegularFile(openedIdentity, expectedIdentity.dev, expectedIdentity.ino);
+    return await readBoundedText(handle, maximumTransactionJournalBytes);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function archiveTransactionJournal(runtimeRoot, expectedJournal) {
+  const journalPath = transactionJournalPath(runtimeRoot);
+  const serialized = await readTransactionJournal(runtimeRoot);
+  const observedJournal = parseTransactionJournal(serialized);
+  if (JSON.stringify(observedJournal) !== JSON.stringify(expectedJournal)) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS");
+  }
+  const stateDirectory = path.dirname(journalPath);
+  const archiveDirectory = path.join(stateDirectory, transactionArchiveDirectoryName);
+  await mkdir(archiveDirectory, { recursive: true, mode: 0o700 });
+  await syncDirectory(stateDirectory);
+  const archivePath = path.join(
+    archiveDirectory,
+    `${expectedJournal.txid}-${expectedJournal.operation}.json`,
+  );
+  await assertPathAbsent(archivePath, "RELEASE_TRANSACTION_ARCHIVE_EXISTS");
+  await rename(journalPath, archivePath);
+  await Promise.all([
+    syncDirectory(stateDirectory),
+    syncDirectory(archiveDirectory),
+  ]);
+}
+
+function transactionJournalPath(runtimeRoot) {
+  return path.join(runtimeRoot, "state", transactionJournalFilename);
+}
+
+function parseTransactionJournal(serialized) {
+  try {
+    const value = JSON.parse(serialized);
+    assertExactKeys(value, [
+      "automationObservations",
+      "before",
+      "candidate",
+      "candidateStagingIdentity",
+      "candidateStagingTarget",
+      "desired",
+      "installerClaim",
+      "legacyTarget",
+      "maintenanceLease",
+      "maintenanceNonce",
+      "operation",
+      "phase",
+      "recoveryAutomationObservations",
+      "txid",
+      "version",
+    ]);
+    if (
+      value.version !== 2 ||
+      !["install", "rollback"].includes(value.operation) ||
+      ![
+        "maintenance-staged",
+        "awaiting-commit",
+        "candidate-moving",
+        "prepared",
+        "legacy-migrating",
+        "legacy-migrated",
+        "previous-prepared",
+        "current-switched",
+      ]
+        .includes(value.phase)
+    ) {
+      throw new Error("INVALID_TRANSACTION_JOURNAL");
+    }
+    assertUuid(value.txid);
+    assertUuid(value.maintenanceNonce);
+    value.installerClaim = parseJournalInstallerClaim(value.installerClaim);
+    value.maintenanceLease = parseJournalMaintenanceLease(
+      value.maintenanceLease,
+      value.maintenanceNonce,
+    );
+    assertExactKeys(value.automationObservations, ["commit", "precheck"]);
+    value.automationObservations.precheck = parseJournalAutomationObservation(
+      value.automationObservations.precheck,
+    );
+    if (value.automationObservations.commit !== null) {
+      value.automationObservations.commit = parseJournalAutomationObservation(
+        value.automationObservations.commit,
+      );
+      if (
+        value.automationObservations.precheck.observationId ===
+        value.automationObservations.commit.observationId
+      ) {
+        throw new Error("INVALID_TRANSACTION_OBSERVATIONS");
+      }
+    } else if (
+      !["maintenance-staged", "awaiting-commit"].includes(value.phase)
+      && value.recoveryAutomationObservations === null
+    ) {
+      throw new Error("INVALID_TRANSACTION_OBSERVATIONS");
+    }
+    if (value.recoveryAutomationObservations !== null) {
+      assertExactKeys(value.recoveryAutomationObservations, ["commit", "precheck"]);
+      value.recoveryAutomationObservations.precheck = parseJournalAutomationObservation(
+        value.recoveryAutomationObservations.precheck,
+      );
+      value.recoveryAutomationObservations.commit = parseJournalAutomationObservation(
+        value.recoveryAutomationObservations.commit,
+      );
+      if (
+        value.recoveryAutomationObservations.precheck.observationId ===
+        value.recoveryAutomationObservations.commit.observationId
+      ) {
+        throw new Error("INVALID_TRANSACTION_OBSERVATIONS");
+      }
+    }
+    if (value.phase === "maintenance-staged") {
+      if (value.before !== null || value.desired !== null) {
+        throw new Error("INVALID_TRANSACTION_POINTER_STATE");
+      }
+    } else {
+      assertExactKeys(value.before, ["current", "previous"]);
+      assertExactKeys(value.desired, ["current", "previous"]);
+      value.before.current = parseJournalPointerState(value.before.current, true);
+      value.before.previous = parseJournalPointerState(value.before.previous, false);
+      value.desired.current = parseJournalPointerState(value.desired.current, false);
+      value.desired.previous = parseJournalPointerState(value.desired.previous, false);
+    }
+    if (value.candidate !== null) {
+      value.candidate = parseJournalPointerState(value.candidate, false);
+      if (value.candidate.kind !== "validated") {
+        throw new Error("INVALID_TRANSACTION_CANDIDATE");
+      }
+    }
+    if (
+      value.legacyTarget !== null &&
+      (typeof value.legacyTarget !== "string" ||
+        value.legacyTarget !== path.posix.join(".releases", `legacy-${value.txid}`))
+    ) {
+      throw new Error("INVALID_TRANSACTION_LEGACY_TARGET");
+    }
+    if (
+      value.candidateStagingTarget !== null
+      && (
+        value.operation !== "install"
+        || typeof value.candidateStagingTarget !== "string"
+        || !/^\.releases\/\.staging-[^/]+$/u.test(value.candidateStagingTarget)
+      )
+    ) {
+      throw new Error("INVALID_TRANSACTION_CANDIDATE");
+    }
+    if (value.candidateStagingIdentity !== null) {
+      assertExactKeys(value.candidateStagingIdentity, ["device", "inode"]);
+      if (
+        value.operation !== "install"
+        || typeof value.candidateStagingIdentity.device !== "string"
+        || !/^\d+$/u.test(value.candidateStagingIdentity.device)
+        || typeof value.candidateStagingIdentity.inode !== "string"
+        || !/^\d+$/u.test(value.candidateStagingIdentity.inode)
+      ) {
+        throw new Error("INVALID_TRANSACTION_CANDIDATE");
+      }
+    }
+    if (
+      (value.candidateStagingTarget === null)
+      !== (value.candidateStagingIdentity === null)
+    ) {
+      throw new Error("INVALID_TRANSACTION_CANDIDATE");
+    }
+    return value;
+  } catch (error) {
+    throw new Error("RELEASE_TRANSACTION_STATE_AMBIGUOUS", { cause: error });
+  }
+}
+
+function parseJournalInstallerClaim(value) {
+  assertExactKeys(value, [
+    "device",
+    "inode",
+    "journalSha256",
+    "nonce",
+    "previousNonce",
+  ]);
+  if (
+    typeof value.device !== "string"
+    || !/^\d+$/u.test(value.device)
+    || typeof value.inode !== "string"
+    || !/^\d+$/u.test(value.inode)
+  ) {
+    throw new Error("INVALID_TRANSACTION_INSTALLER_CLAIM");
+  }
+  assertUuid(value.nonce);
+  if (value.previousNonce !== null) assertUuid(value.previousNonce);
+  if (
+    value.journalSha256 !== null
+    && !manifestSha256Pattern.test(value.journalSha256)
+  ) {
+    throw new Error("INVALID_TRANSACTION_INSTALLER_CLAIM");
+  }
+  return value;
+}
+
+function parseJournalMaintenanceLease(value, maintenanceNonce) {
+  assertExactKeys(value, [
+    "device",
+    "inode",
+    "nonce",
+    "path",
+    "pid",
+    "processStartedAt",
+  ]);
+  if (
+    value.path !== path.posix.join("state", "live-operation.lock") ||
+    typeof value.device !== "string" ||
+    !/^\d+$/u.test(value.device) ||
+    typeof value.inode !== "string" ||
+    !/^\d+$/u.test(value.inode) ||
+    value.nonce !== maintenanceNonce ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    !isIsoDateTime(value.processStartedAt)
+  ) {
+    throw new Error("INVALID_TRANSACTION_MAINTENANCE_LEASE");
+  }
+  return value;
+}
+
+function parseJournalAutomationObservation(value) {
+  assertExactKeys(value, [
+    "automationId",
+    "observedAt",
+    "observationId",
+    "requestId",
+    "status",
+    "targetCount",
+  ]);
+  assertUuid(value.requestId);
+  assertUuid(value.observationId);
+  if (
+    value.automationId !== "automation" ||
+    value.targetCount !== 1 ||
+    value.status !== "PAUSED" ||
+    !isIsoDateTime(value.observedAt)
+  ) {
+    throw new Error("INVALID_TRANSACTION_AUTOMATION_OBSERVATION");
+  }
+  return value;
+}
+
+function parseJournalPointerState(value, allowLegacy) {
+  assertExactKeys(
+    value,
+    value?.kind === "validated"
+      ? ["kind", "manifestSha256", "target"]
+      : ["kind"],
+  );
+  if (value.kind === "absent") return absentState();
+  if (allowLegacy && value.kind === "legacy") return { kind: "legacy" };
+  if (
+    value.kind !== "validated" ||
+    typeof value.target !== "string" ||
+    !manifestSha256Pattern.test(value.manifestSha256)
+  ) {
+    throw new Error("INVALID_TRANSACTION_POINTER_STATE");
+  }
+  return validatedState(value.target, value.manifestSha256);
+}
+
+async function assertPathAbsent(targetPath, errorCode) {
+  try {
+    await lstat(targetPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(errorCode);
+}
+
+function assertCommitGateOptions(options) {
+  try {
+    assertUuid(options?.txid);
+    assertUuid(options?.maintenanceNonce);
+    assertUuid(options?.automationRequestId);
+    if (
+      typeof options?.now !== "function" ||
+      !isIsoDateTime(options.requestedAt) ||
+      !Number.isSafeInteger(options.maximumAgeMs) ||
+      options.maximumAgeMs <= 0
+    ) {
+      throw new Error("INVALID_COMMIT_GATE_OPTIONS");
+    }
+    const now = options.now();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error("INVALID_COMMIT_GATE_CLOCK");
+    }
+  } catch (error) {
+    throw new Error("RELEASE_COMMIT_DECISION_INVALID", { cause: error });
+  }
+}
+
+function parseMaintenanceMetadata(serialized) {
+  try {
+    const value = JSON.parse(serialized);
+    assertExactKeys(value, [
+      "acquiredAt",
+      "maintenanceNonce",
+      "pid",
+      "processStartedAt",
+      "purpose",
+      "txid",
+      "version",
+    ]);
+    if (
+      value.version !== 1 ||
+      value.purpose !== "release-maintenance" ||
+      !Number.isSafeInteger(value.pid) ||
+      value.pid <= 0 ||
+      !isIsoDateTime(value.processStartedAt) ||
+      !isIsoDateTime(value.acquiredAt)
+    ) {
+      throw new Error("INVALID_MAINTENANCE_METADATA");
+    }
+    assertUuid(value.txid);
+    assertUuid(value.maintenanceNonce);
+    return value;
+  } catch (error) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS", { cause: error });
+  }
+}
+
+function sameMaintenanceMetadata(left, right) {
+  return (
+    left.version === right.version &&
+    left.purpose === right.purpose &&
+    left.txid === right.txid &&
+    left.maintenanceNonce === right.maintenanceNonce &&
+    left.pid === right.pid &&
+    left.processStartedAt === right.processStartedAt &&
+    left.acquiredAt === right.acquiredAt
+  );
+}
+
+function parseInstallerMetadata(serialized) {
+  try {
+    const value = JSON.parse(serialized);
+    assertExactKeys(value, [
+      "acquiredAt",
+      "installerNonce",
+      "operation",
+      "pid",
+      "previousInstallerNonce",
+      "processStartedAt",
+      "purpose",
+      "transactionJournalSha256",
+      "txid",
+      "version",
+    ]);
+    if (
+      value.version !== 1 ||
+      value.purpose !== "release-installer" ||
+      !["install", "rollback"].includes(value.operation) ||
+      !Number.isSafeInteger(value.pid) ||
+      value.pid <= 0 ||
+      !isIsoDateTime(value.processStartedAt) ||
+      !isIsoDateTime(value.acquiredAt)
+    ) {
+      throw new Error("INVALID_INSTALLER_METADATA");
+    }
+    assertUuid(value.txid);
+    assertUuid(value.installerNonce);
+    if (value.previousInstallerNonce !== null) assertUuid(value.previousInstallerNonce);
+    if (
+      value.transactionJournalSha256 !== null
+      && !manifestSha256Pattern.test(value.transactionJournalSha256)
+    ) {
+      throw new Error("INVALID_INSTALLER_METADATA");
+    }
+    return value;
+  } catch (error) {
+    throw new Error("RELEASE_INSTALLER_LEASE_AMBIGUOUS", { cause: error });
+  }
+}
+
+function sameInstallerMetadata(left, right) {
+  return (
+    left.version === right.version &&
+    left.purpose === right.purpose &&
+    left.operation === right.operation &&
+    left.txid === right.txid &&
+    left.installerNonce === right.installerNonce &&
+    left.previousInstallerNonce === right.previousInstallerNonce &&
+    left.transactionJournalSha256 === right.transactionJournalSha256 &&
+    left.pid === right.pid &&
+    left.processStartedAt === right.processStartedAt &&
+    left.acquiredAt === right.acquiredAt
+  );
+}
+
+function assertExactKeys(value, expectedKeys) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("INVALID_OBJECT");
+  }
+  const actualKeys = Object.keys(value).sort();
+  const sortedExpected = [...expectedKeys].sort();
+  if (
+    actualKeys.length !== sortedExpected.length ||
+    actualKeys.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new Error("UNEXPECTED_FIELDS");
+  }
+}
+
+function assertUuid(value) {
+  if (typeof value !== "string" || !uuidPattern.test(value)) {
+    throw new Error("INVALID_UUID");
+  }
+}
+
+function isIsoDateTime(value) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return false;
+  return new Date(value).toISOString() === value;
+}
+
+async function inspectProcessOwnerIdentity(owner) {
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ESRCH") return "dead";
+    return "unknown";
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      "/bin/ps",
+      ["-o", "lstart=", "-p", String(owner.pid)],
+      {
+        encoding: "utf8",
+        env: {
+          LANG: "C",
+          PATH: "/usr/bin:/bin",
+        },
+        timeout: 2_000,
+      },
+    );
+    const actualStartedAt = Date.parse(stdout.trim());
+    const expectedStartedAt = Date.parse(owner.processStartedAt);
+    if (!Number.isFinite(actualStartedAt) || !Number.isFinite(expectedStartedAt)) {
+      return "unknown";
+    }
+    return Math.abs(actualStartedAt - expectedStartedAt) <= 2_000
+      ? "alive-exact"
+      : "pid-reused";
+  } catch {
+    try {
+      process.kill(owner.pid, 0);
+      return "unknown";
+    } catch (error) {
+      return isNodeError(error) && error.code === "ESRCH" ? "dead" : "unknown";
+    }
+  }
+}
+
+function isStrictDescendant(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative.length > 0 && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+async function readBounded(handle) {
+  return readBoundedText(handle, maximumMaintenanceMetadataBytes);
+}
+
+async function readBoundedText(handle, maximumBytes) {
+  const buffer = Buffer.alloc(maximumBytes + 1);
+  let length = 0;
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+    if (bytesRead === 0) break;
+    length += bytesRead;
+  }
+  if (length > maximumBytes) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+  return buffer.subarray(0, length).toString("utf8");
+}
+
+function assertExactRegularFile(identity, device, inode) {
+  if (!identity.isFile() || identity.dev !== device || identity.ino !== inode) {
+    throw new Error("RELEASE_MAINTENANCE_LEASE_AMBIGUOUS");
+  }
+}
+
+async function removeCreatedMarker(lockPath, stateDirectory, handle) {
+  try {
+    const [owned, current] = await Promise.all([handle.stat(), lstat(lockPath)]);
+    if (owned.isFile() && current.isFile() && owned.dev === current.dev && owned.ino === current.ino) {
+      await unlink(lockPath);
+      await syncDirectory(stateDirectory);
+    }
+  } catch {
+    // Failed initialization never removes a path whose identity cannot be proven.
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function syncDirectory(directory) {
+  const handle = await open(directory, constants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+function isNodeError(error) {
+  return error instanceof Error && "code" in error;
+}
+
+function sha256Text(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}

@@ -1,0 +1,103 @@
+# Standalone automation capability boundary. The immutable release installer
+# materializes this file as the runtime project's .codex/config.toml target.
+approval_policy = "never"
+default_permissions = "weather-read-only"
+web_search = "disabled"
+
+[tools]
+web_search = false
+
+[permissions.weather-read-only]
+extends = ":read-only"
+
+[permissions.weather-read-only.network]
+enabled = false
+enable_socks5 = false
+enable_socks5_udp = false
+allow_upstream_proxy = false
+allow_local_binding = false
+dangerously_allow_non_loopback_proxy = false
+dangerously_allow_all_unix_sockets = false
+
+[features]
+network_proxy = false
+apps = false
+plugins = false
+remote_plugin = false
+browser_use = false
+browser_use_external = false
+in_app_browser = false
+computer_use = false
+workspace_dependencies = false
+multi_agent = false
+skill_mcp_dependency_install = false
+tool_suggest = false
+image_generation = false
+shell_tool = false
+unified_exec = false
+
+[mcp_servers.wechat-history]
+command = "/usr/bin/false"
+enabled = false
+
+[mcp_servers.wechat-current]
+command = "/usr/bin/false"
+enabled = false
+
+[mcp_servers.wechat-live]
+command = "/usr/bin/false"
+enabled = false
+
+[mcp_servers.node_repl]
+command = "/usr/bin/false"
+enabled = false
+
+[mcp_servers.computer-use]
+command = "/usr/bin/false"
+enabled = false
+
+[mcp_servers.chat-assistant-supervisor]
+command = "/Users/example/Desktop/聊天助手/runtime-v2/current/bin/chat-assistant-supervisor"
+args = []
+startup_timeout_sec = 30
+tool_timeout_sec = 95
+required = true
+enabled_tools = [
+  "abort-draft",
+  "begin-scheduled-tick",
+  "close",
+  "prepare-broadcast",
+  "prepare-latest-reply",
+  "research-morning-weather",
+  "show-comfort-station",
+  "submit-authorized-broadcast",
+  "submit-authorized-draft",
+  "verify-draft",
+  "verify-send",
+]
+
+[mcp_servers.chat-assistant-supervisor.env]
+CHAT_ASSISTANT_DATA_DIR = "/Users/example/Desktop/聊天助手/runtime-v2"
+CHAT_ASSISTANT_MODE = "live"
+HOME = "/Users/example"
+NODE_OPTIONS = ""
+NODE_PATH = ""
+
+[mcp_servers.official-research]
+command = "/Users/example/Desktop/聊天助手/runtime-v2/current/bin/official-research"
+args = []
+startup_timeout_sec = 30
+tool_timeout_sec = 30
+required = true
+enabled_tools = ["research_latest_trigger"]
+
+[mcp_servers.official-research.env]
+CHAT_ASSISTANT_DATA_DIR = "/Users/example/Desktop/聊天助手/runtime-v2"
+CHAT_ASSISTANT_MODE = "observe"
+HOME = "/Users/example"
+NODE_OPTIONS = ""
+NODE_PATH = ""
+
+[mcp_servers.daily-care-supervisor]
+command = "/usr/bin/false"
+enabled = false
