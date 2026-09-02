@@ -30,7 +30,7 @@ npm test
 npm run native:test
 ```
 
-项目要求 Node.js 20，并在 macOS 上使用 Swift 工具链验证原生桥接部分。
+项目要求 Node.js 20，并在 macOS 上使用 Swift 工具链验证原生桥接部分。`npm test` 使用串行文件模式，避免发布事务类测试与清理 `dist/` 的测试并行运行时互相影响。
 
 ## 目录
 

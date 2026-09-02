@@ -16,7 +16,7 @@
     "mcp:live": "node dist/src/mcp/live-server-main.js",
     "native:kernel-lock:build": "node scripts/build-kernel-lock-addon.mjs",
     "native:test": "swift test --package-path native/WechatVisionBridge",
-    "test": "npm run build && vitest run",
+    "test": "npm run build && vitest run --no-file-parallelism",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
